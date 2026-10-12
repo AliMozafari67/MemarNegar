@@ -10,7 +10,6 @@ import time
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import seaborn as sns
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold, cross_val_predict, \
     RepeatedStratifiedKFold
@@ -21,8 +20,8 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.feature_selection import RFE, RFECV
 from sklearn.naive_bayes import GaussianNB, BernoulliNB, MultinomialNB
 from sklearn.svm import SVC
-from sklearn.dummy import DummyClassifier, DummyRegressor
-from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression
 import xgboost as xgb
 from sklearn.inspection import permutation_importance
 from sklearn.base import clone
@@ -31,7 +30,7 @@ from scipy import stats as scipy_stats
 from temporal_config import (verify_cutoff_consistency, TemporalCutoffMismatch,
                              verified_anchor_commit, ALLOW_WHOLE_HISTORY)
 
-# ====================== Logging Configuration ======================
+# Logging
 class InfoFilter(logging.Filter):
     def filter(self, record): return record.levelno == logging.INFO
 
@@ -41,35 +40,19 @@ logger.setLevel(logging.INFO)
 logger.propagate = False
 EXPORT_DIR = "ExportFiles"
 
-# These two are re-assigned per project by configure_logging() below, so the
-# rest of the module (which reads them as globals) always points at the
-# currently-processed project's output folder.
+# Set per project by configure_logging()
 PROJECT_NAME = None
 project_dir = None
 
-# In-memory buffer that mirrors exactly what the console handler prints.
-# It is reset for every project in configure_logging() and, once a project's
-# pipeline finishes, its content is flushed to "Result (<project>) Log.txt".
+# Mirrors console output; flushed to 'Result (<project>) Log.txt' after each project
 console_log_buffer = None
 
-# Tracks which projects configure_logging()/save_console_log_to_file() have
-# already been called for DURING THIS PROCESS. run_pipeline() and
-# run_pipeline_followups() now both call these for the same project (main
-# comparison, then follow-up analyses once the primary model is known) - the
-# first call for a project should overwrite any log left over from a
-# previous run of this script, but the second call for the SAME project in
-# THIS run must APPEND rather than erase what run_pipeline already wrote.
+# Projects already logged in this run: the first call overwrites the log, later calls append
 _projects_logged_this_run = set()
 
 
 def configure_logging(project_name):
-    """(Re)configure the module-level logger for the given project.
-
-    Sets the global PROJECT_NAME / project_dir, points the file handler at
-    that project's own log file, and attaches a StringIO handler that
-    captures the same INFO-level lines shown on the console so they can be
-    saved to a per-project text file at the end of the run.
-    """
+    """(Re)configure the logger and globals for a project; attaches file and in-memory console handlers."""
     global PROJECT_NAME, project_dir, console_log_buffer
 
     PROJECT_NAME = project_name
@@ -84,19 +67,12 @@ def configure_logging(project_name):
     console_handler.addFilter(InfoFilter())
     console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 
-    # 'w' the first time this project is configured in this run (fresh log,
-    # same as before), 'a' on any later call in the SAME run (e.g.
-    # run_pipeline_followups() re-configuring after run_pipeline already
-    # ran for this project) so earlier lines are not erased.
+    # Overwrite on the first call for a project in this run, append afterwards
     file_handler = logging.FileHandler(os.path.join(project_dir, 'git_stability_results.log'), mode=file_mode, encoding='utf-8')
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 
-    # Captures exactly what the console shows, so it can be dumped to
-    # "Result (<project>) Log.txt" once this project's run is complete.
-    # Always starts EMPTY on every call (even the 'a' case above) -
-    # save_console_log_to_file() below appends its content to the existing
-    # file rather than this buffer accumulating across calls itself.
+    # Captures console output for the per-project log dump; reset on every call
     console_log_buffer = io.StringIO()
     buffer_handler = logging.StreamHandler(console_log_buffer)
     buffer_handler.setLevel(logging.INFO)
@@ -110,13 +86,7 @@ def configure_logging(project_name):
 
 
 def log_progress(prefix, current, total, start_time):
-    """Log a 'N/total (pct%) | elapsed | ETA' line.
-
-    Deliberately goes through `logger` (not tqdm/print) so it shows up in
-    the console, in git_stability_results.log, AND in the per-project
-    'Result (<project>) Log.txt' dump - tqdm's carriage-return-based bar
-    would not be captured by any of the three.
-    """
+    """Log a 'N/total (pct%) | elapsed | ETA' line via `logger` so it reaches the console and all log files."""
     elapsed = time.time() - start_time
     pct = 100.0 * current / total if total else 0.0
     rate = elapsed / current if current else 0.0
@@ -126,13 +96,7 @@ def log_progress(prefix, current, total, start_time):
 
 
 def save_console_log_to_file():
-    """Write everything printed to the console during this project's current
-    logging segment to 'Result (<project name>) Log.txt' in the project's
-    output folder. The first time this is called for a project in this run
-    it overwrites (fresh file); any later call for the SAME project (e.g.
-    once more after run_pipeline_followups()) appends, so the file ends up
-    containing the full run (main comparison + follow-up analyses) instead
-    of only whichever pass happened to save last."""
+    """Write the captured console output to 'Result (<project>) Log.txt' (overwrite on the first call per run, append afterwards)."""
     global _projects_logged_this_run
     log_path = os.path.join(project_dir, f"Result ({PROJECT_NAME}) Log.txt")
     is_first_write_this_run = PROJECT_NAME not in _projects_logged_this_run
@@ -143,7 +107,7 @@ def save_console_log_to_file():
     logger.info(f"Console log saved to: {log_path}")
 
 
-# ====================== Computational and Data Preparation Functions (Modified for Git) ======================
+# Feature groups and data preparation
 FEATURE_GROUPS = {
     'static': ['loc', 'cc_class', 'cbo_approx', 'lcom4_approx',
                'num_methods', 'total_method_cc', 'ccn', 'architecture_size'],
@@ -163,12 +127,7 @@ VIEW_SETS = {
 
 RF_PARAM_GRID = {'n_estimators': [100, 200], 'max_depth': [10, 15], 'min_samples_split': [5, 10]}
 
-# Hoisted to module level (was previously defined locally inside run_pipeline
-# at "6. Define parameters and models") so run_rq1_ablation,
-# run_repeated_stratified_cv, run_alpha_sensitivity_ml_analysis and the LOPO
-# pipeline can also look up any model's grid by name - needed now that the
-# "primary model" used for those follow-up analyses is chosen empirically
-# (see select_primary_model()) instead of being hardcoded to RandomForest.
+# Module-level so follow-up analyses and LOPO can look up any model's grid by name
 MODEL_PARAM_GRIDS = {
     'RandomForest': {'n_estimators': [100, 200], 'max_depth': [10, 15], 'min_samples_split': [5, 10]},
     'GaussianNB': {'var_smoothing': [1e-9, 1e-8]},
@@ -178,47 +137,23 @@ MODEL_PARAM_GRIDS = {
     'DummyStratified': {},
     'LogisticRegression': {'C': [0.01, 0.1, 1, 10]},
 }
-# Models eligible to be picked as the "primary model" (see select_primary_model)
-# or included in multi-model LOPO. Excludes the two Dummy baselines, which
-# exist purely as a floor for comparison, not as real candidate models.
+# Candidates for primary model / multi-model LOPO (Dummy baselines excluded)
 CANDIDATE_MODEL_NAMES = ['RandomForest', 'GaussianNB', 'XGBoost', 'SVM', 'LogisticRegression']
 
-# PERF FIX: a single reasonable, fixed RandomForest configuration (roughly
-# the middle of RF_PARAM_GRID). Used by run_rq1_ablation, run_repeated_stratified_cv
-# and run_alpha_sensitivity_ml_analysis instead of re-running a full
-# GridSearchCV(cv=5) over RF_PARAM_GRID on every single repeat/fold/alpha.
-# Those three functions exist to compare VIEWS, SPLITS or ALPHA values against
-# each other with a model that is "good and held constant" - re-tuning
-# hyperparameters from scratch inside every one of their iterations was
-# pure wasted compute, not extra rigor (see train_classification_model's
-# skip_grid_search argument). The one-time model comparison in run_pipeline
-# and the LOPO evaluation still use the full GridSearchCV, since picking the
-# best-tuned model per algorithm IS the point there.
+# Fixed RandomForest config (middle of RF_PARAM_GRID), used by the ablation, repeated-CV and
+# alpha analyses instead of re-running GridSearchCV in every iteration.
 RF_FIXED_PARAMS = {'n_estimators': 200, 'max_depth': 15, 'min_samples_split': 5}
 
-# BUGFIX: run_alpha_sensitivity_ml_analysis() used to reference
-# ALPHA_SENSITIVITY_GRID via `'ALPHA_SENSITIVITY_GRID' in globals()` without
-# this name ever being defined anywhere in the module - harmless at runtime
-# (Python's ternary short-circuits so the name is never actually evaluated
-# when missing), but PyCharm/pyflakes correctly flag it as an unresolved
-# reference since the symbol doesn't exist. Defining it here removes the
-# warning and gives the sweep an explicit, visible default.
 ALPHA_SENSITIVITY_GRID = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
-# The six raw metrics architecture_size is derived from (see prepare_data_combined).
-# Kept as a module-level constant so both run_pipeline and run_rq1_ablation can
-# recompute architecture_size from TRAIN-ONLY statistics after their own splits.
+# Raw metrics architecture_size is derived from; recomputed from train-only statistics after each split
 SIZE_FACTORS = ['loc', 'num_methods', 'cbo_approx', 'lcom4_approx', 'total_method_cc', 'cc_class']
 
 
 def add_train_test_architecture_size(X_train, X_test, size_factors=SIZE_FACTORS):
-    """Phase 4 fix: architecture_size used to be normalized with min/max
-    computed over the WHOLE dataset (train+test) inside prepare_data_combined,
-    before any split existed - i.e. test-set values leaked into a predictor.
-    Here architecture_size is instead built strictly from X_train's min/max
-    for each raw size factor, and those same min/max values (never recomputed
-    from X_test) are applied to both splits. Returns (X_train, X_test) copies
-    with an 'architecture_size' column added.
+    """Add 'architecture_size' to copies of X_train/X_test using train-only min/max of each raw size factor.
+
+    Returns (X_train, X_test).
     """
     X_train = X_train.copy()
     X_test = X_test.copy()
@@ -238,35 +173,16 @@ def add_train_test_architecture_size(X_train, X_test, size_factors=SIZE_FACTORS)
     return X_train, X_test
 
 
-# STAGE-4 FIX (critique item #9): Q80 instability threshold must be
-# estimated from TRAINING rows only, exactly like architecture_size above -
-# never from a distribution that includes the rows that will end up in
-# test/held-out data.
+# Q80 threshold estimated from training rows only
 QUANTILE_THRESHOLD = 0.80
 
 
 def make_stability_labels(change_count, train_index, quantile=QUANTILE_THRESHOLD):
-    """
-    Compute the instability threshold ONLY from the rows in train_index,
-    then apply that fixed threshold to every row (train and test alike).
-    Mirrors add_train_test_architecture_size(): the statistic that defines
-    the decision boundary is estimated from train only, never from test.
+    """Label rows as unstable using a threshold estimated from the train_index rows only.
 
-    Parameters
-    ----------
-    change_count : pd.Series, indexed by class_name (df['real_change_count'])
-        for the full set of rows (both those that will end up in train and
-        in test/this fold).
-    train_index : index-like
-        Row labels (or an Index) selecting the training rows for this
-        split/fold.
-
-    Returns
-    -------
-    labels : pd.Series (0/1), same index as change_count
-    threshold : float, the train-only cutoff. This WILL vary slightly
-        across different splits/CV folds - that's expected and should be
-        logged/reported, not hidden or averaged away.
+    change_count: Series (class_name -> raw change count) for all rows.
+    train_index: labels selecting the training rows.
+    Returns (labels 0/1 Series, train-only threshold). The threshold varies across splits/folds; report it.
     """
     train_counts = change_count.loc[train_index]
     threshold = train_counts.quantile(quantile)
@@ -277,26 +193,13 @@ def make_stability_labels(change_count, train_index, quantile=QUANTILE_THRESHOLD
 
 
 def make_stratification_proxy(change_count, n_bins=5):
-    """
-    Used ONLY to keep train_test_split(..., stratify=...) / StratifiedKFold
-    balanced BEFORE the real Q80 label exists for this split. Bins
-    change_count into quintiles (by rank, so it works for skewed/zero-heavy
-    distributions too) instead of using the future 0/1 label itself - this
-    does not reintroduce the leakage being fixed here, it only keeps splits
-    balanced by "how often does this class change" rather than by the exact
-    top-20% cutoff we are not allowed to know before the split.
-    """
+    """Quintile bins of change_count (by rank), used only to stratify splits before the real Q80 label exists."""
     ranks = change_count.rank(method="first")
     return pd.qcut(ranks, q=n_bins, labels=False)
 
 
 def compute_scale_pos_weight(y_train):
-    """Phase 4 fix (item 3): XGBoost's imbalance handling was previously left
-    at its default (no weighting) while RandomForest/SVM used
-    class_weight='balanced'. scale_pos_weight = N_negative / N_positive
-    (XGBoost's own documented convention), computed from TRAINING labels only,
-    puts XGBoost on the same footing as the other class-weighted models.
-    """
+    """XGBoost scale_pos_weight = N_negative / N_positive, computed from training labels only."""
     y_train_arr = np.asarray(y_train)
     n_pos = int(np.sum(y_train_arr == 1))
     n_neg = int(np.sum(y_train_arr == 0))
@@ -305,40 +208,18 @@ def compute_scale_pos_weight(y_train):
     return n_neg / n_pos
 
 
-N_ABLATION_REPEATS = 10  # STAGE-2 FIX (#15): repeated splits instead of a single lucky/unlucky one
+N_ABLATION_REPEATS = 10
 
 
 def run_rq1_ablation(X, change_count, project_name, project_dir, train_classification_model, evaluate_classification_model,
                      n_repeats=N_ABLATION_REPEATS, model_name='RandomForest', fixed_params=None):
-    """
-    X: the FULL feature matrix from prepare_data_combined (before your
-       existing RFE-based select_features call).
-    change_count: df['real_change_count'] from prepare_data_combined - the
-       RAW continuous change count, NOT a pre-fixed 0/1 label. STAGE-4 FIX
-       (critique item #9): the Q80 label is now built fresh on every repeat,
-       from that repeat's TRAIN rows only (see make_stability_labels below),
-       instead of being computed once from the whole dataset before any
-       split existed.
-    train_classification_model / evaluate_classification_model:
-          pass in the functions already defined in your script 4,
-          unchanged.
-    model_name / fixed_params: which model (and which held-constant
-       hyperparameters) to use for every repeat/view. Defaults to
-       RandomForest + RF_FIXED_PARAMS for backward compatibility, but
-       __main__ now passes in the empirically-selected "primary model" (see
-       select_primary_model()) and that model's own GridSearchCV-tuned
-       params for THIS project (captured during run_pipeline's main model
-       comparison), instead of an arbitrary hand-picked config.
+    """Leave-one-view-out ablation over n_repeats stratified splits.
 
-    STAGE-2 FIX (#15): a single train_test_split (as before) cannot tell you
-    whether a gap like Full=0.84 vs No-Propagation=0.79 reflects a real
-    contribution or sampling variability from that one particular split.
-    This now repeats the split n_repeats times (same stratify/test_size,
-    varying random_state), records each view's balanced accuracy on every
-    repeat, and reports mean +/- 95% CI per view plus a paired t-test and
-    Cohen's d effect size for each ablated view vs the Full view (paired on
-    the repeat index, since the same repeat's train/test rows are shared
-    across views).
+    X: full feature matrix.
+    change_count: raw change counts (the Q80 label is built per repeat from train rows).
+    train_classification_model / evaluate_classification_model: the pipeline's training/evaluation functions.
+    model_name / fixed_params: model and held-constant hyperparameters (default RandomForest + RF_FIXED_PARAMS).
+    Reports mean +/- 95% CI per view, plus a paired t-test and Cohen's d of each ablated view vs Full.
     """
     if fixed_params is None:
         fixed_params = RF_FIXED_PARAMS if model_name == 'RandomForest' else {}
@@ -355,16 +236,12 @@ def run_rq1_ablation(X, change_count, project_name, project_dir, train_classific
         X_train_full, X_test_full, cc_train, cc_test = train_test_split(
             X, change_count, test_size=0.2, stratify=strat_proxy, random_state=seed
         )
-        # STAGE-4 FIX (critique item #9): threshold estimated from THIS
-        # repeat's TRAIN rows only, then applied unchanged to this repeat's
-        # test rows.
+        # Threshold from this repeat's train rows only
         y_train, repeat_threshold = make_stability_labels(change_count, X_train_full.index)
         y_train = y_train.loc[X_train_full.index]
         y_test = (change_count.loc[X_test_full.index] >= repeat_threshold).astype(int)
 
-        # Phase 4 fix: X passed in no longer contains 'architecture_size' (it is
-        # excluded in prepare_data_combined to avoid leakage). Rebuild it here from
-        # THIS split's train-only statistics, matching how the main pipeline does it.
+        # Rebuild architecture_size from this split's train-only statistics
         X_train_full, X_test_full = add_train_test_architecture_size(X_train_full, X_test_full)
 
         for view_name, cols in VIEW_SETS.items():
@@ -384,8 +261,7 @@ def run_rq1_ablation(X, change_count, project_name, project_dir, train_classific
                 index=X_test_view.index, columns=X_test_view.columns
             )
 
-            # PERF FIX: fixed config instead of a fresh GridSearchCV(cv=5)
-            # on every (repeat, view) pair - see RF_FIXED_PARAMS comment.
+            # Fixed config instead of GridSearchCV per (repeat, view)
             model, _, _ = train_classification_model(
                 X_train_scaled, y_train, model_name, param_grid,
                 skip_grid_search=True, fixed_params=fixed_params
@@ -427,8 +303,7 @@ def run_rq1_ablation(X, change_count, project_name, project_dir, train_classific
             'Mean_Balanced_Accuracy': mean, 'CI95': ci95,
             'Std': arr.std(ddof=1) if arr.size > 1 else 0.0,
         }
-        # Paired test vs Full (STAGE-2 FIX #15): is the gap distinguishable
-        # from sampling noise, and how large is it (Cohen's d)?
+        # Paired test vs Full view, with Cohen's d
         if view_name != 'Full (Static+Network+Propagation)' and full_scores.size == arr.size and arr.size > 1:
             try:
                 t_stat, p_val = scipy_stats.ttest_rel(full_scores, arr)
@@ -519,7 +394,6 @@ def compute_graph_features(graph):
     return features
 
 
-# **************** Main Data Preparation Function (Modified) ****************
 def prepare_data_combined(graph_features, code_metrics, propagation_frequencies, project_dir):
     logger.info("--- Preparing dataset (Using Git History as Ground Truth) ---")
 
@@ -527,23 +401,13 @@ def prepare_data_combined(graph_features, code_metrics, propagation_frequencies,
     metrics_nodes = set(code_metrics.keys())
     propagation_nodes = set(propagation_frequencies.keys())
 
-    # 1. Load Git History
-    # STAGE-1 TEMPORAL-SPLIT FIX: prefer the "after-cutoff" window
-    # (class_change_frequency_after.pkl) as the TARGET, since it was
-    # produced from a future window that propagation_frequency (built only
-    # from the "before-cutoff" window when TEMPORAL_CUTOFF_DATE is set in
-    # scripts 1/3) cannot see. Falls back to the whole-history file only if
-    # the temporal-split files aren't present, with an explicit warning that
-    # this reproduces the leaky (non-temporal) configuration.
+    # 1. Load change history; the after-cutoff window is the prediction target
     historical_file_after = os.path.join(project_dir, "class_change_frequency_after.pkl")
     historical_file_whole = os.path.join(project_dir, "class_change_frequency.pkl")
     project_name_for_log = os.path.basename(os.path.normpath(project_dir))
-    # Temporal separation is mandatory: the whole-history file contains the very future
-    # commits the features must not see. Fallback only if explicitly allowed in
-    # temporal_config.py (legacy/leaky mode, never for the paper).
+    # Whole-history fallback only if allowed in temporal_config.py (leaky; never for the paper)
     if os.path.exists(historical_file_after):
-        # Hard stop unless the markers of scripts 0, 1, 2 and 3 all exist and agree on
-        # the cutoff datetime and on the anchor commit.
+        # Hard stop unless the upstream cutoff markers all exist and agree on cutoff and anchor commit
         cutoff_used = verify_cutoff_consistency(project_dir, project_name=project_name_for_log)
         historical_file = historical_file_after
         logger.info("Using temporally-separated 'after-cutoff' change counts as the target "
@@ -561,22 +425,7 @@ def prepare_data_combined(graph_features, code_metrics, propagation_frequencies,
         with open(historical_file, "rb") as f:
             historical_changes_raw = pickle.load(f)
 
-        # STAGE-1 ENTITY-RESOLUTION FIX: historical_changes_raw is already
-        # keyed by the fully-qualified, path-based class identity (see
-        # get_class_name_from_relpath in the historical-changes script), and
-        # so are graph_features / code_metrics / propagation_frequencies as
-        # of this fix (see get_fqn_from_path / get_class_name_from_path in
-        # the co-change and dependency-graph scripts). They are therefore
-        # used directly, with no name-collapsing step. The previous version
-        # collapsed 'a.b.ClassName' down to 'ClassName' here "to match the
-        # graph" and explicitly SUMMED the change counts of any classes that
-        # happened to share a simple name across different packages — a
-        # genuine entity-resolution error that both silently corrupted the
-        # regression/classification target and made results non-reproducible
-        # across codebases with different naming collision rates. Do not
-        # reintroduce name-collapsing here; if a mismatch/leakage warning
-        # appears below, the fix belongs in the upstream identity
-        # convention, not in a post-hoc rename in this function.
+        # All inputs use fully-qualified, path-based class names; do not collapse them to simple names
         historical_changes = dict(historical_changes_raw)
         history_nodes = set(historical_changes.keys())
         logger.info(
@@ -584,7 +433,6 @@ def prepare_data_combined(graph_features, code_metrics, propagation_frequencies,
 
     except FileNotFoundError:
         logger.error(f"History file '{historical_file}' not found! Run script 3 first.")
-        # Fix return count to 5 (add one None at the end)
         return pd.DataFrame(), pd.Series(), pd.Series(), None, None
 
     # 2. Find Common Classes
@@ -593,12 +441,10 @@ def prepare_data_combined(graph_features, code_metrics, propagation_frequencies,
 
     if not common_classes:
         logger.error("No common classes found! (Check naming consistency between Graph and Git History)");
-        # Fix return count to 5
         return pd.DataFrame(), pd.Series(), pd.Series(), None, None
 
     # 3. Calculate Architecture Size (for normalization and cost proxy)
     size_factors = ['loc', 'num_methods', 'cbo_approx', 'lcom4_approx', 'total_method_cc', 'cc_class']
-    # Use dictionary for fast DataFrame creation
     data_dict = {}
     for cls in common_classes:
         data_dict[cls] = {factor: code_metrics.get(cls, {}).get(factor, 0) for factor in size_factors}
@@ -623,24 +469,15 @@ def prepare_data_combined(graph_features, code_metrics, propagation_frequencies,
         features.update(code_metrics.get(cls, {}))
         features['class_name'] = cls
         features['propagation_frequency'] = propagation_frequencies.get(cls, 0)
-        # Use .get to avoid error if class is not in temp_data (though it shouldn't happen)
         features['architecture_size'] = temp_data.loc[cls, 'architecture_size'] if cls in temp_data.index else 0
-        features['real_change_count'] = historical_changes.get(cls, 0)  # Key for labeling
+        features['real_change_count'] = historical_changes.get(cls, 0)
         combined_features_list.append(features)
 
     df = pd.DataFrame(combined_features_list).set_index('class_name')
     df.fillna(0, inplace=True)
 
-    # 5. Labeling (Classification Target) - STAGE-4 FIX (critique item #9)
-    # We no longer fix the Q80 threshold here on the whole dataset. The
-    # binary label now depends on which rows end up in TRAIN for a given
-    # split/fold, so it cannot be computed until after that split exists.
-    # This function only reports a DESCRIPTIVE whole-dataset threshold
-    # (for logging/context) - it is never used as the actual modeling
-    # target. Callers must call make_stability_labels(df['real_change_count'],
-    # train_index) themselves, right after they know their own train_index
-    # (see run_pipeline, run_rq1_ablation, run_repeated_stratified_cv,
-    # run_alpha_sensitivity_ml_analysis, run_leave_one_project_out_pipeline).
+    # 5. Descriptive whole-dataset Q80 threshold (reporting only).
+    # Model labels come from make_stability_labels() using train rows only.
     descriptive_threshold_quantile = df['real_change_count'].quantile(QUANTILE_THRESHOLD)
     if descriptive_threshold_quantile == 0:
         descriptive_threshold_quantile = 1
@@ -649,46 +486,25 @@ def prepare_data_combined(graph_features, code_metrics, propagation_frequencies,
         f"percentile of changes: {descriptive_threshold_quantile:.0f}. Actual training/evaluation "
         f"labels are computed per-split from TRAIN rows only via make_stability_labels()."
     )
-    # Kept ONLY for descriptive/reporting tables that summarize the whole
-    # project at once (e.g. display_architecture_factors_quantile_table) -
-    # NEVER used as the actual train/test label for training or evaluating
-    # any model; those labels come from make_stability_labels(), called by
-    # each split/fold with that split's own TRAIN-only threshold.
+    # Descriptive only; never used as a train/test label
     df['stability_label'] = (df['real_change_count'] >= descriptive_threshold_quantile).astype(int)
     counts_preview = df['stability_label'].value_counts()
     logger.info(f"[descriptive only] Class distribution at whole-dataset threshold: "
                 f"Stable(0): {counts_preview.get(0, 0)} | Unstable(1): {counts_preview.get(1, 0)}")
 
-    # 6. Continuous Target (Regression Target)
-    # STAGE-2 FIX (critique item #18): the previous target,
-    # git_based_stability = 1 - MinMax(real_change_count), is not a
-    # well-defined 'stability' construct - it is only a dataset-relative
-    # inverse-rank of change count, so adding a single outlier class (e.g.
-    # 1000 changes) silently rescales every other class's 'stability'. It
-    # is kept below ONLY as a descriptive quantity for the cost-proxy table
-    # (display purposes), never as the regression target.
-    #
-    # The regression target used by the model is now log1p(real_change_count)
-    # directly - a standard variance-stabilizing transform for a right-skewed
-    # count variable (see also item #19: evaluate with MAE/RMSE/R2/Spearman/
-    # Pearson rather than MSE alone, since 'stability' units no longer apply).
+    # 6. Regression target: log1p(change count), a variance-stabilizing transform for right-skewed counts.
+    # git_based_stability is kept only for descriptive tables.
     scaler = MinMaxScaler()
     changes_reshaped = df['real_change_count'].values.reshape(-1, 1)
     df['norm_change_count'] = scaler.fit_transform(changes_reshaped)
     df['git_based_stability'] = 1.0 - df['norm_change_count']  # descriptive/display only - NOT the model target
-    df['log_future_change_count'] = np.log1p(df['real_change_count'])  # STAGE-2 regression target
+    df['log_future_change_count'] = np.log1p(df['real_change_count'])  # regression target
 
-    # 7. Cost Proxy (Required for Comparison Tables) - descriptive/reporting
-    # quantity only, unrelated to what the regressor is trained/evaluated on.
+    # 7. Cost proxy (descriptive only)
     df['cost'] = df['architecture_size'] * (1 - df['git_based_stability'])
 
-    # 8. Extract final X, y, y_regression
-    # 'architecture_size' is intentionally excluded here (Phase 4 fix): as
-    # computed above it uses min/max over the WHOLE dataset, which would leak
-    # test-set statistics into a model feature. It is kept in df/df_for_reporting
-    # for descriptive tables and the 'cost' proxy, but as a MODEL FEATURE it is
-    # rebuilt from TRAIN-ONLY statistics after the split, via
-    # add_train_test_architecture_size() in run_pipeline / run_rq1_ablation.
+    # 8. Final X, y. 'architecture_size' is excluded as a model feature (whole-dataset min/max would leak);
+    # it is rebuilt from train-only statistics after each split.
     drop_cols = ['stability_label', 'real_change_count', 'git_based_stability', 'norm_change_count',
                  'log_future_change_count', 'cost', 'architecture_size']
     # Keep numeric columns as features, remove target columns
@@ -696,15 +512,9 @@ def prepare_data_combined(graph_features, code_metrics, propagation_frequencies,
 
     # Remove possible non-numeric columns that may have been added
     X = df[feature_cols].select_dtypes(include=np.number)
-    # STAGE-4 FIX (critique item #9): second return value is now the RAW,
-    # continuous change_count series, NOT a pre-fixed 0/1 label. Every
-    # caller must derive its own train-only label via make_stability_labels()
-    # right after it knows its train_index for this split/fold.
+    # Second value is the raw continuous change_count; callers derive a train-only label via make_stability_labels()
     change_count = df['real_change_count']
-    # STAGE-2 FIX: y_stability now holds log1p(future_change_count), the
-    # actual regression target (see comments above) - the variable name is
-    # kept as y_stability only to avoid touching every call site; its
-    # CONTENT is the corrected target, not the old MinMax-inverted score.
+    # y_stability holds log1p(future change count), the regression target (name kept for existing call sites)
     y_stability = df['log_future_change_count']
 
     logger.info(f"Raw features before train-only architecture_size is added back ({len(X.columns)}): "
@@ -715,16 +525,11 @@ def prepare_data_combined(graph_features, code_metrics, propagation_frequencies,
 
     return X, change_count, y_stability, descriptive_threshold_quantile, df_for_reporting
 
-# ====================== Reporting Functions (No change in logic) ======================
-# These functions require 'cost' and 'stability' columns (now git_based_stability).
+# Reporting functions
 
 def select_features(X, y, n_features=15, min_features_to_select=5, cv_folds=5):
-    # Phase 2 fix: previously this used a hardcoded RFE target (n_features=15)
-    # that was >= the 14 available raw features, so RFE never actually removed
-    # anything. Now the optimal feature count is chosen by RFECV (cross-validated
-    # RFE) using 5-fold stratified CV balanced-accuracy on the data passed in
-    # (X, y must already be the TRAINING split only - see run_pipeline, Phase 1).
-    # n_features is kept only as the target for the fallback path if RFECV errors.
+    # RFECV (5-fold stratified, balanced accuracy) picks the feature count; X, y must be the training split only.
+    # n_features is only the fallback if RFECV fails.
     if X.empty or y.empty: logger.error("Cannot perform feature selection on empty data."); return pd.DataFrame(), []
     logger.info(f"Starting feature selection with RFECV (cross-validated RFE, {cv_folds}-fold CV, "
                 f"min_features_to_select={min_features_to_select})...")
@@ -757,37 +562,10 @@ def select_features(X, y, n_features=15, min_features_to_select=5, cv_folds=5):
 
 def train_classification_model(X_train, y_train, model_name, param_grid,
                                 skip_grid_search=False, fixed_params=None):
-    """
-    PERF FIX: added skip_grid_search / fixed_params. When skip_grid_search
-    is True, this fits the model ONCE with fixed_params (no GridSearchCV at
-    all), instead of GridSearchCV(cv=5) over param_grid - i.e. len(param_grid
-    combinations) * 5 fits collapse to 1 fit. run_rq1_ablation,
-    run_repeated_stratified_cv, and run_alpha_sensitivity_ml_analysis call
-    many independent repeats/folds/alphas, each of which was separately
-    re-tuning hyperparameters from scratch; they now reuse RF_FIXED_PARAMS
-    instead. The one-time model comparison in run_pipeline and the LOPO
-    pipeline still call this with skip_grid_search=False (the default), so
-    their reported numbers are still from a real tuned model.
-    """
-    # Phase 4 fix (item 2): now returns (best_model, best_cv_score) instead of
-    # just best_model. best_cv_score is GridSearchCV's mean 5-fold CV balanced
-    # accuracy on X_train/y_train ONLY - it lets run_pipeline pick the "best"
-    # model without ever looking at test-set performance (Cawley & Talbot,
-    # 2010: selecting a model by test-set score biases the reported test
-    # score). GridSearchCV was already computing this internally; we simply
-    # keep and return best_score_ instead of discarding it.
-    #
-    # Now returns a 3-tuple (best_model, best_cv_score, best_params): best_params
-    # is grid_search.best_params_ when a real grid search ran, or exactly the
-    # fixed_params that were used when skip_grid_search=True. This lets a
-    # caller capture "whatever hyperparameters were actually used" and reuse
-    # them later (see select_primary_model / run_pipeline_followups) instead
-    # of guessing a fixed config by hand.
-    #
-    # Phase 4 fix (item 3): XGBoost previously had no imbalance handling while
-    # RandomForest/SVM used class_weight='balanced'. scale_pos_weight is now
-    # computed from y_train only (never test), putting all class-weighted
-    # models on comparable footing.
+    """Train a classifier. With skip_grid_search=True, fit once with fixed_params instead of GridSearchCV(cv=5)."""
+    # Returns (best_model, best_cv_score, best_params). The train-only CV score is used for model selection,
+    # never test performance. best_params is the grid-search result, or fixed_params if the search was skipped.
+    # XGBoost gets scale_pos_weight from y_train, for parity with the class-weighted models.
     logger.info(f"Starting training of {model_name} (classification)...")
     start_time = time.time()
     model = {'RandomForest': RandomForestClassifier(random_state=42, class_weight='balanced'),
@@ -795,8 +573,7 @@ def train_classification_model(X_train, y_train, model_name, param_grid,
              'XGBoost': xgb.XGBClassifier(random_state=42, eval_metric='logloss',
                                           scale_pos_weight=compute_scale_pos_weight(y_train)),
              'SVM': SVC(random_state=42, probability=True, class_weight='balanced'),
-             # STAGE-2 FIX (#20): weak/standard baselines, so a reviewer can see the
-             # proposed model actually beats trivial and simple-linear references.
+             # Baselines: trivial and simple linear references
              'DummyMostFrequent': DummyClassifier(strategy='most_frequent', random_state=42),
              'DummyStratified': DummyClassifier(strategy='stratified', random_state=42),
              'LogisticRegression': LogisticRegression(random_state=42, class_weight='balanced',
@@ -843,16 +620,7 @@ def train_classification_model(X_train, y_train, model_name, param_grid,
 
 
 def train_stability_model(X_train, y_train, y_stability_train, class_model, model_name_prefix):
-    # Phase 3 fix: previously the probability feature fed to the regressor
-    # came from class_model.predict_proba(X_train) - i.e. the SAME classifier
-    # scoring the SAME rows it was fit on, which leaks the classifier's
-    # in-sample overfitting into the regressor's training features. This is a
-    # known pitfall in stacked generalization (Wolpert, 1992) and the standard
-    # fix is to use out-of-fold (OOF) predictions: a clone of the classifier is
-    # refit on 5 folds and, for each fold, scores only the held-out rows.
-    # y_train here is the binary classification target (0/1), required to run
-    # the CV folds; y_stability_train is the continuous regression target the
-    # final regressor is fit on, unchanged from before.
+    # Out-of-fold classifier probabilities feed the regressor (avoids in-sample leakage)
     logger.info(f"Starting training of stability model for {model_name_prefix} (RandomForestRegressor)...")
     start_time = time.time()
 
@@ -893,7 +661,6 @@ def train_stability_model(X_train, y_train, y_stability_train, class_model, mode
 
 
 def evaluate_classification_model(model, X_test, y_test, model_name="Model"):
-    # (evaluate_classification_model function code remains unchanged)
     logger.info(f"--- Evaluating {model_name} (classification) ---")
     results = {'Accuracy': np.nan, 'Balanced Accuracy': np.nan, 'F1 Macro': np.nan, 'AUC-ROC': np.nan, 'PR AUC': np.nan}
     try:
@@ -923,7 +690,7 @@ def evaluate_classification_model(model, X_test, y_test, model_name="Model"):
             try:
                 precision, recall, _ = precision_recall_curve(y_test, y_prob_norm)
                 pr_auc = calculate_auc(recall, precision)
-                # Plot PR Curve                 plt.figure(figsize=(8, 6))
+                # Plot PR curve
                 plt.plot(recall, precision, marker='.', label=f'{model_name} (PR AUC = {pr_auc:.2f})')
                 plt.xlabel('Recall'); plt.ylabel('Precision')
                 plt.title(f'Precision-Recall Curve ({model_name})')
@@ -956,24 +723,13 @@ def evaluate_classification_model(model, X_test, y_test, model_name="Model"):
 
 
 def evaluate_stability_model(stability_regressor, X_test, y_stability_test, class_model, model_name_prefix):
-    """
-    STAGE-2 FIX (#18/#19): y_stability_test is now log1p(future_change_count)
-    (see prepare_data_combined), not the old MinMax-inverted 'stability'
-    score, so 'Predicted Stability' is no longer a meaningful description of
-    the output. Evaluation now reports MAE, RMSE, R^2, Spearman rho, and
-    Pearson r on the log1p(change-count) scale, rather than MSE alone -
-    MSE alone gives no sense of typical error magnitude or how well the
-    ranking of classes by predicted future change activity matches the
-    actual ranking (which is arguably the more decision-relevant property
-    for prioritizing review/refactoring effort).
-    """
+    """Evaluate the regressor on the log1p(change count) scale: MAE, RMSE, R^2, Spearman rho, Pearson r."""
     logger.info(f"--- Evaluating {model_name_prefix} (future change-count regression) ---")
     results = {'MAE': np.nan, 'RMSE': np.nan, 'R2': np.nan, 'Spearman': np.nan, 'Pearson': np.nan,
                'Predicted_Mean_Log_Change_Count': np.nan}
     if stability_regressor is None: logger.error(
         f"Stability regressor for {model_name_prefix} is None. Cannot evaluate."); return results
     try:
-        # Note: class_model.predict_proba is used to augment features for the regressor
         test_probs_positive = class_model.predict_proba(X_test)[:, 1].reshape(-1, 1) if hasattr(class_model,
                                                                                                 "predict_proba") else class_model.predict(
             X_test).reshape(-1, 1)
@@ -1008,10 +764,7 @@ def evaluate_stability_model(stability_regressor, X_test, y_stability_test, clas
 
 
 def plot_stability_comparison(stability_results, filename='git_stability_comparison.png'):
-    """Plot comparison chart of RMSE and mean predicted future-change activity
-    across models. STAGE-2 FIX: updated to the new regression target/metrics
-    (log1p(future_change_count), evaluated with RMSE among others) - the old
-    'Predicted Stability'/'MSE' keys no longer exist in stability_results."""
+    """Plot RMSE and mean predicted future-change activity per model."""
     logger.info("Generating stability comparison plot...")
 
     # Filter invalid results
@@ -1028,29 +781,23 @@ def plot_stability_comparison(stability_results, filename='git_stability_compari
     predicted_activity = [valid_results[model].get('Predicted_Mean_Log_Change_Count', np.nan) for model in model_names]
     rmses = [valid_results[model].get('RMSE', np.nan) for model in model_names]
 
-    # === Plotting section ===
 
-    # 1. Define figure and primary axis (ax1)
     try:
-        fig, ax1 = plt.subplots(figsize=(12, 7))  # This line defines ax1.
+        fig, ax1 = plt.subplots(figsize=(12, 7))
 
         ax1.set_xlabel('Models')
         ax1.set_ylabel('Predicted Mean log1p(Future Change Count)', color='skyblue')
 
-        # Draw bars on primary axis
         ax1.bar(model_names, predicted_activity, color='skyblue', edgecolor='black',
                 label='Predicted Mean log1p(Future Change Count)')
         ax1.tick_params(axis='y', labelcolor='skyblue')
 
-        # 2. Define secondary axis (ax2)
         ax2 = ax1.twinx()
         ax2.set_ylabel('RMSE (log1p change-count scale)', color='tab:red')
 
-        # Draw line on secondary axis
         ax2.plot(model_names, rmses, color='tab:red', linestyle=':', marker='o', label='RMSE')
         ax2.tick_params(axis='y', labelcolor='tab:red')
 
-        # 3. Set secondary axis limits with NaN handling
         valid_rmses = [m for m in rmses if not np.isnan(m)]
         if valid_rmses:
             min_rmse = np.min(valid_rmses)
@@ -1060,17 +807,14 @@ def plot_stability_comparison(stability_results, filename='git_stability_compari
         fig.suptitle('Comparison of Predicted Future Change Activity and RMSE Across Models', fontsize=14)
         fig.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-        # Save and close
         plt.savefig(os.path.join(project_dir, filename))
         plt.close()
         logger.info(f"Stability comparison plot saved at {os.path.join(project_dir, filename)}")
-        #
 
     except Exception as e:
         logger.error(f"Critical error during plotting stability comparison: {e}")
 
 def display_comparison_table(class_results, stability_results, X_test, y_test, trained_class_models, selected_features):
-    # (display_comparison_table function code remains unchanged, but output interpreted based on Git logic)
     logger.info("\n--- Comparison Table for All Models (Sorted by Balanced Accuracy) ---")
     header = "| {:<15} | {:<19} | {:<15} | {:<15} | {:<15} | {:<23} | {:<20} | {:<25} | {:<25} |".format("Model",
                                                                                                          "Balanced Accuracy",
@@ -1119,23 +863,19 @@ def display_comparison_table(class_results, stability_results, X_test, y_test, t
         row_str = f"| {row['Model']:<15} | {row['Balanced Accuracy']:<19.4f} | {row['PR AUC']:<15.4f} | {row['F1 Macro']:<15.4f} | {row['AUC-ROC']:<15.4f} | {row['Change-Count RMSE']:<23.4f} | {row['Change-Count Spearman']:<20.4f} | {row['Mean Architecture Size (Unstable)']:<25.2f} | {row['Mean Architecture Cost (Unstable)']:<25.2f} |"
         logger.info(row_str)
 
-    # Also saved as a structured CSV (in addition to the log lines above) so
-    # downstream reporting (5-GenerateProjectReport.py) doesn't have to
-    # scrape the log file for these numbers.
+    # Also saved as CSV for the downstream report script
     comparison_csv_path = os.path.join(project_dir, "comparison_table.csv")
     df.to_csv(comparison_csv_path, index=False)
     logger.info(f"Comparison table saved to '{comparison_csv_path}'")
 
 
 def display_architecture_factors_quantile_table(data):
-    # (display_architecture_factors_quantile_table function code remains unchanged)
     logger.info("\n--- Summary Table for Architecture Size Factors by Quantile ---")
 
     # To prevent errors if columns are missing in DataFrame
     required_cols = ['architecture_size', 'stability_label', 'real_change_count', 'loc', 'num_methods', 'cbo_approx',
                      'lcom4_approx', 'total_method_cc', 'cc_class', 'cost', 'git_based_stability']
 
-    # If using the new prepare_data_combined function, all these columns should be present.
 
     header = "| {:<15} | {:<10} | {:<10} | {:<12} | {:<10} | {:<12} | {:<15} | {:<10} | {:<15} | {:<15} | {:<10} | {:<12} | {:<15} |".format(
         "Range", "Count", "loc", "num_methods", "cbo_approx", "lcom4_approx", "total_method_cc", "cc_class",
@@ -1147,7 +887,6 @@ def display_architecture_factors_quantile_table(data):
     quantiles = data['architecture_size'].quantile([0, 0.25, 0.5, 0.75, 1.0]).values
     labels = ['Low (0-25%)', 'Low-Mid (25-50%)', 'High-Mid (50-75%)', 'High (75-100%)']
 
-    # Use git_based_stability column instead of stability
     data['quantile'] = pd.cut(data['architecture_size'], bins=quantiles, labels=labels, include_lowest=True,
                               duplicates='drop')
 
@@ -1160,9 +899,9 @@ def display_architecture_factors_quantile_table(data):
         'total_method_cc': 'mean',
         'cc_class': 'mean',
         'cost': 'mean',
-        'git_based_stability': 'mean',  # Use new column
+        'git_based_stability': 'mean',
         'stability_label': lambda x: 100 * np.mean(x),
-        'real_change_count': 'mean'  # Add average real changes
+        'real_change_count': 'mean'
     }).reset_index()
 
     grouped.columns = ['Range', 'Count', 'Arch Size', 'loc', 'num_methods', 'cbo_approx', 'lcom4_approx',
@@ -1177,31 +916,11 @@ def display_architecture_factors_quantile_table(data):
 
 def run_repeated_stratified_cv(X, change_count, project_name, project_dir, model_name='RandomForest', param_grid=None,
                                fixed_params=None, n_splits=5, n_repeats=10, n_features=15):
-    """
-    STAGE-2 FIX (#16): a single test_size=0.2/random_state=42 split can give
-    a result that is very different from what seed=7/21/100 would give,
-    especially with a class-level dataset of a few hundred rows. This runs
-    RepeatedStratifiedKFold (n_splits x n_repeats folds total), refitting
-    feature selection/scaling/model on each training fold (never touching
-    that fold's held-out rows), and reports mean +/- 95% CI - a far more
-    defensible number for the paper than a single split.
+    """Repeated stratified K-fold CV; feature selection, scaling and the model are fitted on each training fold.
 
-    Uses the FULL X, change_count (before RFE/scaling), matching
-    prepare_data_combined's output for one project. Rebuilds
-    architecture_size AND the Q80 label per-fold from that fold's TRAIN rows
-    only (STAGE-4 FIX, critique item #9), exactly like the main single-split
-    pipeline.
-
-    model_name / fixed_params: which model (and which held-constant
-    hyperparameters) to reuse across every fold. __main__ now passes in the
-    empirically-selected "primary model" (see select_primary_model()) and
-    that model's own GridSearchCV-tuned params for THIS project (captured
-    during run_pipeline's main model comparison), instead of assuming
-    RandomForest. If fixed_params is given, grid search is always skipped
-    (PERF FIX, regardless of model_name) - re-tuning from scratch on every
-    one of the n_splits*n_repeats folds is wasted compute, not extra rigor,
-    since the whole point of this analysis is variance across FOLDS, not
-    across hyperparameter choices.
+    Uses the full X and raw change_count; architecture_size and the Q80 label are rebuilt per fold from train rows only.
+    model_name / fixed_params: held-constant model; if fixed_params is given, grid search is skipped.
+    Reports mean +/- 95% CI.
     """
     if param_grid is None:
         param_grid = MODEL_PARAM_GRIDS.get(model_name, RF_PARAM_GRID)
@@ -1215,8 +934,7 @@ def run_repeated_stratified_cv(X, change_count, project_name, project_dir, model
     rcv_start_time = time.time()
     for fold_idx, (train_idx, test_idx) in enumerate(rskf.split(X, strat_proxy)):
         X_train_full, X_test_full = X.iloc[train_idx].copy(), X.iloc[test_idx].copy()
-        # STAGE-4 FIX (critique item #9): threshold estimated from THIS
-        # fold's TRAIN rows only, then applied unchanged to this fold's test rows.
+        # Threshold from this fold's train rows only
         y_train, fold_threshold = make_stability_labels(change_count, X_train_full.index)
         y_train = y_train.loc[X_train_full.index]
         y_test = (change_count.loc[X_test_full.index] >= fold_threshold).astype(int)
@@ -1231,8 +949,7 @@ def run_repeated_stratified_cv(X, change_count, project_name, project_dir, model
         X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), index=X_train.index, columns=X_train.columns)
         X_test_scaled = pd.DataFrame(scaler.transform(X_test), index=X_test.index, columns=X_test.columns)
 
-        # PERF FIX: fixed config instead of a fresh GridSearchCV(cv=5) on
-        # every one of the n_splits*n_repeats folds - see docstring above.
+        # Fixed config instead of GridSearchCV per fold
         model, _, _ = train_classification_model(X_train_scaled, y_train, model_name, param_grid,
                                                   skip_grid_search=skip_grid_search,
                                                   fixed_params=fixed_params)
@@ -1270,9 +987,7 @@ def run_repeated_stratified_cv(X, change_count, project_name, project_dir, model
             summary_rows.append({"Metric": c, "Mean": mean, "CI95": ci95, "Std": std, "N_Folds": len(vals)})
     logger.info(f"Per-fold results saved to '{csv_path}'")
 
-    # Also saved as a small aggregate summary (mean +/- 95% CI per metric),
-    # in addition to the per-fold CSV above, so downstream reporting
-    # (5-GenerateProjectReport.py) doesn't have to recompute it from raw folds.
+    # Also saved as an aggregate summary (mean +/- 95% CI per metric)
     if summary_rows:
         summary_df = pd.DataFrame(summary_rows)
         summary_csv_path = os.path.join(project_dir, f"repeated_cv_{model_name}_{project_name}_summary.csv")
@@ -1285,31 +1000,11 @@ def run_repeated_stratified_cv(X, change_count, project_name, project_dir, model
 def run_alpha_sensitivity_ml_analysis(project_name, alpha_grid=None, n_features=15,
                                       model_name='RandomForest', fixed_params=None,
                                       features_graph=None):
-    """
-    STAGE-3 FIX (critique item #9, ML side): script 2's
-    run_alpha_sensitivity_sweep() only shows how the raw propagation
-    DISTRIBUTION changes with alpha. This shows what actually matters for
-    the paper: how much does ALPHA_STRUCTURAL move (a) classification
-    performance and (b) the predicted ranking of classes, once propagation
-    is plugged into the full feature/model pipeline.
+    """Measure how ALPHA_STRUCTURAL affects classification performance and the predicted class ranking.
 
-    Requires propagation_frequencies_alpha_<a>.pkl files to already exist
-    for this project (produced by run_alpha_sensitivity_sweep with
-    RUN_ALPHA_SENSITIVITY=True in script 2).
-
-    model_name / fixed_params: which model (and which held-constant
-    hyperparameters) to reuse across every alpha value. __main__ now passes
-    in the empirically-selected "primary model" (see select_primary_model())
-    and that model's own GridSearchCV-tuned params for THIS project, instead
-    of assuming RandomForest.
-
-    PERF FIX: features_graph, if given, is compute_graph_features()'s
-    output already computed once by run_pipeline for this SAME project -
-    reused as-is instead of recomputing it here. alpha only changes
-    propagation_frequencies (loaded per-alpha below), never features_graph
-    (which depends only on the dependency graph's structure, not on alpha),
-    so recomputing it was pure duplicated work - up to ~1000s for the larger
-    projects, once per project's follow-up pass.
+    Requires propagation_frequencies_alpha_<a>.pkl files (from the dependency-graph script's alpha sweep).
+    model_name / fixed_params: held-constant model and hyperparameters.
+    features_graph: precomputed compute_graph_features() output, reused if given (it does not depend on alpha).
     """
     if alpha_grid is None:
         alpha_grid = ALPHA_SENSITIVITY_GRID
@@ -1349,9 +1044,7 @@ def run_alpha_sensitivity_ml_analysis(project_name, alpha_grid=None, n_features=
         if X is None or X.empty:
             continue
 
-        # STAGE-4 FIX (critique item #9): same train-only threshold pattern
-        # as run_pipeline/run_rq1_ablation - stratify by a proxy first, then
-        # derive the Q80 label from this split's TRAIN rows only.
+        # Stratify by a proxy, then derive the Q80 label from this split's train rows only
         strat_proxy = make_stratification_proxy(change_count)
         X_train_full, X_test_full, cc_train, cc_test = train_test_split(
             X, change_count, test_size=0.2, stratify=strat_proxy, random_state=42
@@ -1368,7 +1061,7 @@ def run_alpha_sensitivity_ml_analysis(project_name, alpha_grid=None, n_features=
         X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), index=X_train.index, columns=X_train.columns)
         X_test_scaled = pd.DataFrame(scaler.transform(X_test), index=X_test.index, columns=X_test.columns)
 
-        # PERF FIX: fixed config instead of a fresh GridSearchCV(cv=5) per alpha.
+        # Fixed config instead of GridSearchCV per alpha
         model, cv_score, _ = train_classification_model(X_train_scaled, y_train, model_name, param_grid,
                                                          skip_grid_search=True, fixed_params=fixed_params)
         if model is None:
@@ -1398,8 +1091,7 @@ def run_alpha_sensitivity_ml_analysis(project_name, alpha_grid=None, n_features=
     result_df.to_csv(csv_path, index=False)
     logger.info(f"[{project_name}] Alpha ML-performance sensitivity ({model_name}) saved to '{csv_path}'")
 
-    # Ranking stability: Spearman rho between each alpha's predicted
-    # instability-probability ranking and the reference alpha=0.6 ranking.
+    # Ranking stability: Spearman rho vs the reference alpha=0.6 ranking
     if 0.6 in predicted_rankings:
         ref_ranking = predicted_rankings[0.6]
         stability_rows = []
@@ -1422,14 +1114,10 @@ def run_alpha_sensitivity_ml_analysis(project_name, alpha_grid=None, n_features=
 
 
 def load_project_dataset(project_name):
-    """
-    Loads and prepares the (X, change_count, y_stability, df) dataset for a
-    single project, exactly like the start of run_pipeline (steps 1-2), but
-    without doing any split/training. change_count is the RAW continuous
-    change count (STAGE-4 FIX #9) - the caller derives its own train-only
-    Q80 label. Used by both run_pipeline and the Leave-One-Project-Out
-    evaluation below so the two stay consistent.
-    Returns None if any required artifact is missing.
+    """Load and prepare (X, change_count, y_stability, df) for one project, without splitting or training.
+
+    change_count is the raw continuous count; callers derive their own train-only Q80 label.
+    Returns None if a required artifact is missing.
     """
     proj_dir = os.path.join(EXPORT_DIR, project_name)
     graph_file = os.path.join(proj_dir, "dependency_graph.pkl")
@@ -1447,10 +1135,7 @@ def load_project_dataset(project_name):
         return None
 
     features_graph = compute_graph_features(graph)
-    # STAGE-4 FIX (critique item #9): second return value is the RAW
-    # continuous change_count, not a pre-fixed label - LOPO builds its own
-    # label from the pooled TRAINING projects only, in
-    # run_leave_one_project_out_pipeline below.
+    # Second value is the raw change_count; LOPO builds its label from the pooled training projects only
     X, change_count, y_stability, threshold, df = prepare_data_combined(
         features_graph, code_metrics, propagation_frequencies, proj_dir
     )
@@ -1462,48 +1147,14 @@ def load_project_dataset(project_name):
 
 def run_leave_one_project_out_pipeline(projects, model_name='RandomForest',
                                        param_grid=None, n_features=15, preloaded_datasets=None):
-    """
-    STAGE-1 FIX (#28 - unit of observation / independence, and #27 - weak
-    generalization claims from only 3 projects): a class-level, purely
-    random within-project train/test split (the pipeline's default) can let
-    the model learn project-specific patterns rather than genuinely
-    transferable structural/architectural signal, and 3 case-study projects
-    are too few to support a "generalizes to large-scale Java projects"
-    claim on their own. This does NOT fix that weakness (more, more varied
-    projects would be needed for that) but it gives an honest, harder
-    evaluation of what the current 3-project dataset actually supports:
-    for each project P, train on the OTHER projects only and test on all of
-    P. This is the cross-project generalization number that should be
-    reported alongside (not instead of) the within-project split results
-    from run_pipeline, and the gap between the two is itself evidence for
-    or against project-specific overfitting.
+    """Leave-One-Project-Out evaluation: for each project, train on the others and test on it.
 
-    NOTE: with only 3 available projects this yields only 3 folds - still
-    far short of the 8-15 varied projects recommended for a strong
-    generalization claim (see item #27); report this limitation explicitly
-    in Threats to Validity rather than treating 3-fold LOPO as sufficient
-    evidence of generalization on its own.
-
-    PERF FIX: preloaded_datasets, if given, is a dict {project_name:
-    (X, change_count, y_stability, df)} - exactly load_project_dataset()'s
-    return shape - reused as-is instead of calling load_project_dataset()
-    (which redoes compute_graph_features(), up to ~1000s for the larger
-    projects) for every project. __main__ now passes in the SAME data
-    run_pipeline() already computed and returned for each project in Pass 1,
-    so this incurs ZERO extra compute_graph_features() calls - important
-    now that LOPO runs once per top-3 model (see select_primary_model):
-    without this, that recomputation would happen 3x per project instead of
-    a single project's worth of data being reused across all 3 model runs.
+    Reported alongside the within-project results; with only 3 projects it is limited evidence of
+    generalization (state this in Threats to Validity).
+    preloaded_datasets: optional {project: (X, change_count, y_stability, df)} reused instead of load_project_dataset().
     """
     if param_grid is None:
-        # BUG FIX: was hardcoded to RF_PARAM_GRID regardless of model_name,
-        # so GridSearchCV for LOPO always used RandomForest's grid (including
-        # 'min_samples_split', which XGBoost/SVM don't have) even when
-        # model_name='XGBoost' or 'SVM' - silently breaking tuning for any
-        # non-RandomForest model (XGBoost just warns and ignores the unknown
-        # param; for other estimators this can make GridSearchCV fail and
-        # fall back to library defaults). Now looks up the grid for
-        # WHICHEVER model_name was actually passed in.
+        # Use the grid of the requested model_name
         param_grid = MODEL_PARAM_GRIDS.get(model_name, RF_PARAM_GRID)
 
     logger.info("=" * 70)
@@ -1535,21 +1186,13 @@ def run_leave_one_project_out_pipeline(projects, model_name='RandomForest',
         cc_train_full = pd.concat([datasets[p][1] for p in train_projects], axis=0, ignore_index=False)
         X_test_full, cc_test_full = datasets[test_project][0], datasets[test_project][1]
 
-        # Deduplicate the (project, class_name) index so identically-named
-        # classes across different training projects don't collide when
-        # concatenated (index is class_name; different projects can share
-        # simple/qualified names for unrelated classes).
+        # Deduplicate the (project, class_name) index so same-named classes from different projects don't collide
         X_train_full = X_train_full.reset_index(drop=True)
         cc_train_full = cc_train_full.reset_index(drop=True)
         X_test_full = X_test_full.reset_index(drop=True)
         cc_test_full = cc_test_full.reset_index(drop=True)
 
-        # STAGE-4 FIX (critique item #9, LOPO variant): the Q80 threshold is
-        # estimated ONLY from the pooled TRAINING projects' change_count -
-        # this is actually the most realistic case for this fix, since in a
-        # genuine LOPO deployment you would never have seen the held-out
-        # project's distribution at all. The fixed threshold is then applied
-        # to the held-out project unchanged.
+        # Q80 threshold from the pooled training projects only, applied unchanged to the held-out project
         y_train, lopo_threshold = make_stability_labels(cc_train_full, cc_train_full.index)
         y_test = (cc_test_full >= lopo_threshold).astype(int)
         logger.info(f"[{test_project}] LOPO train-pool-only Q80 threshold: {lopo_threshold:.0f} changes "
@@ -1560,8 +1203,7 @@ def run_leave_one_project_out_pipeline(projects, model_name='RandomForest',
             logger.warning(f"[{test_project}] Training pool has a single class after pooling; skipping fold.")
             continue
 
-        # architecture_size rebuilt from TRAIN-projects-only statistics (no
-        # leakage of the held-out project's min/max into the feature).
+        # architecture_size from train-projects-only statistics
         X_train_full, X_test_full = add_train_test_architecture_size(X_train_full, X_test_full)
 
         X_train, selected_features = select_features(X_train_full, y_train, n_features=n_features)
@@ -1617,23 +1259,10 @@ def run_leave_one_project_out_pipeline(projects, model_name='RandomForest',
     return result_df
 
 
-
-# ============================================================================
-# STAGE-4 NEW (critique items #11, #12): inlined from calibration_and_significance.py.
-# A full search of the previous pipeline found NO implementation of Brier
-# score, ECE, McNemar's test, or a real (resampling) bootstrap CI, even
-# though the paper describes all four. What WAS implemented is a 1.96*SEM
-# normal-approximation "95% CI" across repeated-CV repeats, and a paired
-# t-test (not Wilcoxon) of each ablation view vs the Full view - legitimate,
-# but a different question than calibration or pairwise McNemar comparison
-# on one shared test set. These functions are called once per project from
-# run_pipeline, right after the feature-importance block.
-# ============================================================================
+# Calibration (Brier/ECE), pairwise McNemar and bootstrap CI helpers
 
 def _get_positive_class_probability(model, X):
-    """Same predict_proba/decision_function fallback already used elsewhere
-    in this file for ROC-AUC/PR-AUC, factored out so Brier/ECE use the
-    exact same probability values."""
+    """Positive-class probability via predict_proba/decision_function fallback (shared by ROC/PR-AUC, Brier and ECE)."""
     if hasattr(model, "predict_proba"):
         return model.predict_proba(X)[:, 1]
     if hasattr(model, "decision_function"):
@@ -1645,9 +1274,7 @@ def _get_positive_class_probability(model, X):
 
 
 def expected_calibration_error(y_true, y_prob, n_bins=10):
-    """Standard equal-width-bin ECE: partitions [0,1] into n_bins, and for
-    each bin computes |mean predicted probability - observed positive-class
-    frequency|, weighted by the fraction of samples in that bin."""
+    """Equal-width-bin ECE: weighted mean of |mean predicted probability - observed frequency| per bin."""
     y_true = np.asarray(y_true)
     y_prob = np.asarray(y_prob)
     bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
@@ -1692,10 +1319,7 @@ def compute_calibration_table(trained_class_models, X_test, y_test, selected_fea
 
 
 def mcnemar_test(y_true, y_pred_a, y_pred_b):
-    """n01 = model A wrong, model B right; n10 = model A right, model B
-    wrong. Null hypothesis: n01, n10 ~ Binomial(n01+n10, 0.5). Returns
-    (n01, n10, p_value). Uses scipy_stats.binomtest (exact test), so no
-    statsmodels dependency is required."""
+    """Exact McNemar test. n01 = A wrong/B right, n10 = A right/B wrong. Returns (n01, n10, p_value)."""
     y_true = np.asarray(y_true)
     correct_a = (np.asarray(y_pred_a) == y_true)
     correct_b = (np.asarray(y_pred_b) == y_true)
@@ -1710,10 +1334,7 @@ def mcnemar_test(y_true, y_pred_a, y_pred_b):
 
 def compute_pairwise_mcnemar(trained_class_models, X_test, y_test, selected_features,
                              project_dir, project_name, logger):
-    """McNemar for every pair of models on the SAME held-out test set - the
-    PRIMARY pairwise-comparison evidence for the paper (critique item #11);
-    the existing repeated-CV +/- CI numbers remain useful as secondary/
-    robustness evidence."""
+    """McNemar test for every model pair on the same held-out test set."""
     names = [n for n, m in trained_class_models.items() if m is not None]
     predictions = {name: trained_class_models[name].predict(X_test[selected_features]) for name in names}
 
@@ -1735,10 +1356,7 @@ def compute_pairwise_mcnemar(trained_class_models, X_test, y_test, selected_feat
 
 
 def bootstrap_balanced_accuracy_ci(y_true, y_pred, n_boot=2000, ci=0.95, random_state=42):
-    """A REAL bootstrap CI (resampling the test set with replacement) -
-    distinct from the existing 1.96*SEM-across-CV-repeats number used
-    elsewhere in this file, which answers a different question (uncertainty
-    over resampled CV folds, not over which test rows you happened to draw)."""
+    """Bootstrap CI of balanced accuracy, resampling the test set with replacement."""
     rng = np.random.RandomState(random_state)
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
@@ -1782,24 +1400,16 @@ def run_calibration_and_significance_analysis(trained_class_models, X_test, y_te
     return calib_df, mcnemar_df, boot_df
 
 
-# ====================== Main Body (Modified) ======================
+# Main pipeline
 def run_pipeline(project_name):
-    """Run the full hybrid-stability pipeline (steps 1-10) for a single project.
+    """Run the main pipeline (steps 1-10) for one project.
 
-    NOTE: RQ1 ablation, Repeated Stratified CV, and the ML-side alpha
-    sensitivity analysis are deliberately NOT run here anymore. They need an
-    empirically-chosen "primary model" (see select_primary_model()), which
-    can only be picked AFTER every project's comparison_table.csv exists -
-    i.e. after run_pipeline has already run once for ALL projects. See
-    run_pipeline_followups() and __main__ for where they now run instead.
-
-    Returns (X, change_count, project_dir) on success so __main__ can pass
-    them straight into run_pipeline_followups() later without recomputing
-    prepare_data_combined a second time. Returns None on failure.
+    Ablation, repeated CV and alpha sensitivity run later in run_pipeline_followups(), once the primary model is known.
+    Returns (X, change_count, y_stability, df, project_dir, features_graph) on success, None on failure.
     """
     configure_logging(project_name)
 
-    N_FEATURES = 15  # Only used as a fallback cap if RFECV errors (see select_features, Phase 2 fix)
+    N_FEATURES = 15  # Fallback cap if RFECV errors
     logger.info("--- Starting Classification and Regression using Git History (Step 4 Hybrid Stability) ---")
     logger.info(f"--- Project: {project_name} ---")
     main_start_time = time.time()
@@ -1808,7 +1418,7 @@ def run_pipeline(project_name):
     graph_file = os.path.join(project_dir, "dependency_graph.pkl")
     prop_file = os.path.join(project_dir, "propagation_frequencies.pkl")
     metrics_file = os.path.join(project_dir, "code_metrics.pkl")
-    best_model_file = os.path.join(project_dir, f"best_model_git_based.pkl")  # Renamed for clarity
+    best_model_file = os.path.join(project_dir, f"best_model_git_based.pkl")
 
     # 1. Load data
     try:
@@ -1825,14 +1435,8 @@ def run_pipeline(project_name):
     # 2. Compute graph features and prepare data (using Git History)
     features_graph = compute_graph_features(graph)
 
-    # Functions calculate_combined_stability and calculate_cost are no longer called!
-    # Data is taken directly from the new prepare_data_combined
-    # STAGE-4 FIX (critique item #9): second return value is now the RAW,
-    # continuous change_count series - NOT a pre-fixed 0/1 label. The
-    # actual Q80 label is computed below, AFTER the split, from TRAIN rows
-    # only. `threshold` here is the whole-dataset DESCRIPTIVE value only
-    # (used for the quantile reporting table) - it is not what any model is
-    # trained or evaluated against.
+    # change_count is the raw continuous series; the Q80 label is computed after the split from train rows only.
+    # `threshold` is a descriptive whole-dataset value (quantile table only).
     X, change_count, y_stability, threshold, full_df_for_reporting = prepare_data_combined(
         features_graph, code_metrics, propagation_frequencies, project_dir
     )
@@ -1840,10 +1444,7 @@ def run_pipeline(project_name):
     if X is None or X.empty:
         logger.error("Data preparation failed or returned empty DataFrames."); save_console_log_to_file(); return None
 
-    # 3. Split data FIRST (Phase 1 fix: RFE must never see the test set)
-    # STAGE-4 FIX (critique item #9): stratify by a proxy (quintile bin of
-    # change_count) instead of the final Q80 label, since that label must
-    # not be computed until train_index is known - see make_stability_labels.
+    # 3. Split first (RFE must never see test data); stratify by a change_count quintile proxy
     try:
         strat_proxy = make_stratification_proxy(change_count)
         X_train_full, X_test_full, cc_train, cc_test, y_stability_train, y_stability_test = train_test_split(
@@ -1852,10 +1453,7 @@ def run_pipeline(project_name):
     except Exception as e:
         logger.error(f"Error in data splitting: {e}"); save_console_log_to_file(); return None
 
-    # STAGE-4 FIX (critique item #9): the actual Q80 threshold is estimated
-    # from TRAIN rows only, then applied unchanged to the test rows. This
-    # replaces the old `threshold` (whole-dataset, computed before any split
-    # existed) as the value that actually defines the model's target.
+    # Q80 threshold from train rows only, applied unchanged to test rows
     y_train, threshold = make_stability_labels(change_count, X_train_full.index)
     y_train = y_train.loc[X_train_full.index]
     y_test = (change_count.loc[X_test_full.index] >= threshold).astype(int)
@@ -1863,8 +1461,7 @@ def run_pipeline(project_name):
                 f"(train n={len(y_train)}, positives={int(y_train.sum())}; "
                 f"test n={len(y_test)}, positives={int(y_test.sum())}).")
 
-    # Also saved as a small structured file so downstream reporting
-    # (5-GenerateProjectReport.py) doesn't have to scrape the log file.
+    # Also saved as a structured file for the downstream report script
     threshold_info = {
         "project": project_name,
         "train_only_q80_threshold_changes": float(threshold),
@@ -1882,14 +1479,10 @@ def run_pipeline(project_name):
     except Exception as e:
         logger.warning(f"[{project_name}] Could not save train_only_threshold_info.json: {e}")
 
-    # 3.5 Rebuild architecture_size using TRAIN-ONLY min/max (Phase 4 fix, item 1):
-    # previously this feature was normalized over the whole dataset before the
-    # split even existed. Brings the feature count back to 14 for RFECV below.
+    # 3.5 Rebuild architecture_size from train-only min/max
     X_train_full, X_test_full = add_train_test_architecture_size(X_train_full, X_test_full)
 
-    # 4. Feature selection (fit ONLY on the training split; the resulting
-    # feature subset is then applied to the test split without ever letting
-    # RFE see the test labels or test rows)
+    # 4. Feature selection (fit on the training split only)
     X_train, selected_features = select_features(X_train_full, y_train, n_features=N_FEATURES)
     X_test = X_test_full[selected_features]
 
@@ -1900,10 +1493,7 @@ def run_pipeline(project_name):
     X_train_df = pd.DataFrame(X_train_scaled, index=X_train.index, columns=X_train.columns)
     X_test_df = pd.DataFrame(X_test_scaled, index=X_test.index, columns=X_test.columns)
 
-    # 6. Define parameters and models
-    # (uses the module-level MODEL_PARAM_GRIDS, so run_rq1_ablation /
-    # run_repeated_stratified_cv / run_alpha_sensitivity_ml_analysis / LOPO
-    # all look up the same grids by name - see MODEL_PARAM_GRIDS definition.)
+    # 6. Define parameters and models (grids from MODEL_PARAM_GRIDS)
     param_grids = MODEL_PARAM_GRIDS
     model_names = ['RandomForest', 'GaussianNB', 'XGBoost', 'SVM',
                    'DummyMostFrequent', 'DummyStratified', 'LogisticRegression']
@@ -1913,11 +1503,8 @@ def run_pipeline(project_name):
     stability_results = {}
     trained_class_models = {}
     trained_stability_models = {}
-    class_model_cv_scores = {}  # Phase 4 fix (item 2): mean 5-fold CV Balanced
-    # Accuracy on TRAIN only, used to pick the best model instead of test performance
-    class_model_best_params = {}  # GridSearchCV's best_params_ (or {} if none) per model,
-    # captured so select_primary_model()/run_pipeline_followups() can later reuse the
-    # PRIMARY MODEL's own tuned hyperparameters for THIS project instead of a guessed config.
+    class_model_cv_scores = {}  # mean train-only 5-fold CV balanced accuracy (model selection)
+    class_model_best_params = {}  # tuned hyperparameters per model, reused by the follow-up analyses
 
     # 7. Train, evaluate and save results
     models_start_time = time.time()
@@ -1937,7 +1524,7 @@ def run_pipeline(project_name):
         class_eval = evaluate_classification_model(class_model, X_test_df, y_test, model_name)
         class_results[model_name] = class_eval if class_eval else None
 
-        # c) Train regression model (predict stability score based on Git 0.0-1.0)
+        # c) Train regression model (log1p future change count)
         stability_model = train_stability_model(X_train_df, y_train, y_stability_train, class_model, model_name)
         if stability_model is None: continue
         trained_stability_models[model_name] = stability_model
@@ -1948,10 +1535,7 @@ def run_pipeline(project_name):
 
         log_progress(f"[{project_name}] Model training", model_idx + 1, len(model_names), models_start_time)
 
-    # Save every model's tuned hyperparameters (from the GridSearchCV that just
-    # ran above) so the primary-model selection step in __main__ can reuse
-    # them later for RQ1 ablation / Repeated CV / Alpha sensitivity, instead
-    # of guessing a "middle of the grid" config by hand.
+    # Save each model's tuned hyperparameters for reuse by the follow-up analyses
     tuned_hyperparams_path = os.path.join(project_dir, f"tuned_hyperparams_{project_name}.json")
     try:
         with open(tuned_hyperparams_path, "w", encoding="utf-8") as f:
@@ -1969,13 +1553,7 @@ def run_pipeline(project_name):
     # Use full data for quantile table
     display_architecture_factors_quantile_table(full_df_for_reporting)
 
-    # 9. Save best model
-    # Phase 4 fix (item 2): previously the model with the highest Balanced
-    # Accuracy ON THE TEST SET was picked as "best", which uses the test set
-    # for model selection (Cawley & Talbot, 2010: selection-induced optimism).
-    # Now selection uses only class_model_cv_scores (mean 5-fold CV Balanced
-    # Accuracy on the training set); the test set is used purely for the
-    # final, one-time reporting in class_results/display_comparison_table.
+    # 9. Save best model, selected by mean train-CV balanced accuracy (never by test performance)
     valid_cv_scores = {k: v for k, v in class_model_cv_scores.items() if v is not None and not pd.isna(v)}
     best_model_name = max(valid_cv_scores, key=lambda k: valid_cv_scores[k], default=None)
 
@@ -2000,23 +1578,8 @@ def run_pipeline(project_name):
             except Exception as e:
                 logger.error(f"Error saving best model: {e}")
 
-            # 10. Report feature importance for best model
-            # STAGE-4 FIX (critique item #10): previously used native
-            # (impurity-based) importance for any tree model and only fell
-            # back to permutation importance for models without
-            # feature_importances_ (e.g. SVM). Impurity importance is biased
-            # toward high-cardinality / correlated features - exactly the
-            # architecture_size situation the critique flagged (it's itself
-            # an aggregate of several other static features in the same
-            # table). Now EVERY model gets permutation importance on the
-            # held-out test set as the PRIMARY, reported ranking; native
-            # importance (when available) is kept only as a secondary
-            # reference column. A grouped-by-view (Static/Network/
-            # Propagation) table is also produced, using the same
-            # FEATURE_GROUPS mapping already defined above for the RQ1
-            # ablation - this is what actually answers "is architecture_size
-            # really the most important thing, or is that a Static-view
-            # aggregate effect."
+            # 10. Feature importance for the best model: permutation importance on the test set is the primary ranking;
+            # native importance (if available) is a secondary column. A grouped-by-view table is also produced.
             feature_names = list(X_train_df.columns)
 
             perm = permutation_importance(
@@ -2091,10 +1654,7 @@ def run_pipeline(project_name):
             logger.info(f"[{PROJECT_NAME}] Grouped (view-level) importance:\n{grouped_importance_df}")
             logger.info(f"Grouped importance saved to '{grouped_csv_path}'")
 
-            # ---------- STAGE-4 NEW (critique items #11, #12): calibration
-            # (Brier/ECE), pairwise McNemar, and a real bootstrap CI. None of
-            # these existed anywhere in the previous version of this script -
-            # see calibration_and_significance.py. ----------
+            # ---------- Calibration (Brier/ECE), pairwise McNemar, bootstrap CI ----------
             try:
                 run_calibration_and_significance_analysis(
                     trained_class_models, X_test_df, y_test, selected_features,
@@ -2109,46 +1669,19 @@ def run_pipeline(project_name):
 
     logger.info(f"\n--- Process completed in {time.time() - main_start_time:.2f} seconds. ---")
 
-    # Save everything that was printed to the console during this run to
-    # "Result (<project name>) Log.txt" inside the project's output folder.
+    # Save the console output to 'Result (<project>) Log.txt'
     save_console_log_to_file()
 
-    # X, change_count, y_stability, full_df_for_reporting, project_dir, and
-    # features_graph handed back so __main__ can run run_pipeline_followups()
-    # AND run_leave_one_project_out_pipeline() later without recomputing
-    # compute_graph_features()/prepare_data_combined() a second (or, with
-    # multi-model LOPO, third/fourth) time - compute_graph_features() alone
-    # took up to ~1000s for the larger projects when it was being redone
-    # from scratch inside load_project_dataset() for every LOPO call, and
-    # again inside run_alpha_sensitivity_ml_analysis() for every project's
-    # follow-up pass (same graph.pkl, same features - alpha only changes
-    # propagation_frequencies, never features_graph).
+    # Returned for reuse by the follow-up analyses and LOPO (avoids recomputing graph features)
     return X, change_count, y_stability, full_df_for_reporting, project_dir, features_graph
 
 
 def run_pipeline_followups(project_name, X, change_count, project_dir, primary_model_name, primary_fixed_params,
                            features_graph=None):
-    """
-    Runs RQ1 Ablation, Repeated Stratified CV, and the ML-side Alpha
-    Sensitivity analysis for `project_name`, using PRIMARY_MODEL_NAME (an
-    empirically-chosen model - see select_primary_model()) held constant
-    with PRIMARY_FIXED_PARAMS (that model's own GridSearchCV-tuned
-    hyperparameters ON THIS PROJECT, captured during run_pipeline's main
-    model comparison and reused here instead of a manually guessed "middle
-    of the grid" config).
+    """Run RQ1 ablation, repeated stratified CV and ML-side alpha sensitivity for one project.
 
-    Split out from run_pipeline() because the primary model can only be
-    chosen AFTER every project's main model comparison has already run once
-    (see __main__ / select_primary_model). X / change_count / project_dir
-    are exactly what run_pipeline already computed and returned for this
-    project, so prepare_data_combined is not re-run.
-
-    PERF FIX: features_graph, if given, is compute_graph_features()'s output
-    from run_pipeline's own Pass 1 for this SAME project - passed through to
-    run_alpha_sensitivity_ml_analysis so it doesn't call
-    compute_graph_features() a second time (up to ~1000s for the larger
-    projects; alpha only changes propagation_frequencies, never
-    features_graph, so recomputing it per follow-up pass was pure waste).
+    Uses the primary model with this project's tuned hyperparameters. X, change_count and project_dir
+    come from run_pipeline(). features_graph is reused by the alpha analysis to avoid recomputation.
     """
     configure_logging(project_name)  # re-point PROJECT_NAME/project_dir/log buffer at this project
     logger.info("=" * 70)
@@ -2157,16 +1690,12 @@ def run_pipeline_followups(project_name, X, change_count, project_dir, primary_m
     logger.info("=" * 70)
     followups_start_time = time.time()
 
-    # RQ1 Ablation (Leave-One-View-Out) - takes change_count now, builds its
-    # own per-repeat train-only label internally.
+    # RQ1 ablation (leave-one-view-out)
     run_rq1_ablation(X, change_count, project_name, project_dir,
                      train_classification_model, evaluate_classification_model,
                      model_name=primary_model_name, fixed_params=primary_fixed_params)
 
-    # STAGE-2 FIX (#16): Repeated Stratified K-Fold, reported alongside (not
-    # instead of) the single split in run_pipeline, since a single
-    # test_size=0.2/random_state=42 split is not sufficient evidence for a
-    # journal paper.
+    # Repeated stratified K-fold, reported alongside the single split
     try:
         run_repeated_stratified_cv(X, change_count, project_name, project_dir,
                                    model_name=primary_model_name, fixed_params=primary_fixed_params,
@@ -2174,13 +1703,8 @@ def run_pipeline_followups(project_name, X, change_count, project_dir, primary_m
     except Exception as e:
         logger.error(f"Repeated stratified CV failed for '{project_name}': {e}")
 
-    # Alpha (ALPHA_STRUCTURAL) sensitivity, ML side: how much does alpha move
-    # classification performance / predicted ranking once propagation is
-    # plugged into the full pipeline. Requires
-    # propagation_frequencies_alpha_<a>.pkl files produced by script 2's
-    # run_alpha_sensitivity_sweep (RUN_ALPHA_SENSITIVITY=True); if those
-    # files are missing for this project, this just logs a warning per
-    # missing alpha and produces no output, it doesn't abort the run.
+    # ML-side alpha sensitivity; needs propagation_frequencies_alpha_<a>.pkl from the dependency-graph
+    # script (missing files are skipped with a warning).
     try:
         run_alpha_sensitivity_ml_analysis(project_name, n_features=15,
                                           model_name=primary_model_name, fixed_params=primary_fixed_params,
@@ -2191,31 +1715,14 @@ def run_pipeline_followups(project_name, X, change_count, project_dir, primary_m
     logger.info(f"[{project_name}] Follow-up analyses completed in "
                 f"{time.time() - followups_start_time:.2f}s.")
 
-    # Appends this pass's log lines to the SAME "Result (<project name>)
-    # Log.txt" that run_pipeline already wrote (see save_console_log_to_file
-    # append-mode note), so the file still contains the full run.
+    # Appends to the same 'Result (<project>) Log.txt' written by run_pipeline
     save_console_log_to_file()
 
 
 def build_cross_project_summary_table(projects, export_dir):
-    """
-    Aggregates each project's comparison_table.csv (produced by
-    display_comparison_table() inside run_pipeline() - the same numbers
-    reported in the paper's main results table) into ONE cross-project
-    summary: for every model that appears, the mean +/- std of each metric
-    across however many of `projects` it has a row in.
+    """Aggregate each project's comparison_table.csv into a cross-project summary (mean +/- std per model, Dummy baselines included).
 
-    This answers the question a reviewer usually asks first - "how does
-    this model do OVERALL, not just on one project" - without the reader
-    having to eyeball three separate per-project tables and average them by
-    hand. Includes every model in comparison_table.csv (the two Dummy
-    baselines too), unlike select_primary_model()'s ranking, which
-    deliberately excludes Dummy since it's choosing a real candidate.
-
-    Writes '<export_dir>/cross_project_summary.csv' and returns the
-    resulting DataFrame (indexed by Model, one row per model, sorted by mean
-    Balanced Accuracy, descending). 5-GenerateProjectReport.py reads this
-    file back to include it in every project's text report.
+    Writes '<export_dir>/cross_project_summary.csv' and returns it, sorted by mean Balanced Accuracy (descending).
     """
     metric_cols = [
         'Balanced Accuracy', 'PR AUC', 'F1 Macro', 'AUC-ROC',
@@ -2245,9 +1752,7 @@ def build_cross_project_summary_table(projects, export_dir):
     agg = all_df.groupby("Model")[metric_cols].agg(['mean', 'std', 'count'])
     agg.columns = [f"{metric}_{stat}" for metric, stat in agg.columns]
     agg = agg.reset_index().rename(columns={"Balanced Accuracy_count": "N_Projects"})
-    # Drop the redundant per-metric count columns (all equal to N_Projects
-    # unless a metric was NaN for some model/project, which the mean/std
-    # already reflect) - keep only the one count column for readability.
+    # Drop the redundant per-metric count columns; keep one
     agg = agg.drop(columns=[c for c in agg.columns if c.endswith("_count") and c != "N_Projects"])
     agg = agg.sort_values("Balanced Accuracy_mean", ascending=False).reset_index(drop=True)
 
@@ -2270,38 +1775,11 @@ def build_cross_project_summary_table(projects, export_dir):
 
 
 def select_primary_model(projects, export_dir, candidate_models=None):
-    """
-    Chooses ONE "primary model" to hold constant across RQ1 Ablation,
-    Repeated Stratified CV, and the ML-side Alpha Sensitivity analysis for
-    EVERY project - and a ranked top-3 list of models for multi-model LOPO.
+    """Choose the primary model held constant across ablation, repeated CV and alpha sensitivity, plus a top-3 list for LOPO.
 
-    RATIONALE (why this exists at all): RQ1/Repeated-CV/Alpha-Sensitivity
-    are about comparing VIEWS, SPLITS, or ALPHA against each other with a
-    model that is "good and held constant" - re-tuning/reselecting the
-    algorithm inside every one of their iterations would itself be a
-    confound (you could no longer tell whether an ablation result changed
-    because of the view or because a different algorithm got picked). The
-    model must therefore be fixed ONCE, in advance, for ALL projects (so
-    ablation results also stay comparable ACROSS projects) - but it should
-    not be assumed to be RandomForest without checking: if a different
-    algorithm is actually the best performer, hardcoding RandomForest
-    anyway is exactly the kind of unstated assumption a reviewer will catch.
-
-    SELECTION RULE: reads each project's comparison_table.csv (produced by
-    display_comparison_table() inside run_pipeline - i.e. the SAME numbers
-    reported in the paper's main results table), computes each candidate
-    model's mean Balanced Accuracy across all projects where it appears,
-    and picks the argmax. Ties broken by the model's mean rank (lower/better)
-    across projects, then alphabetically for full determinism. Dummy
-    baselines are excluded (see CANDIDATE_MODEL_NAMES) - they exist as a
-    floor for comparison, not as real candidates.
-
-    Returns a dict with keys: primary_model, top3_models_for_lopo,
-    per_model_mean_balanced_accuracy, per_model_project_count,
-    selection_rule, per_project_comparison (raw rows used), missing_projects.
-    Also writes this dict to '<export_dir>/primary_model_selection.json' so
-    5-GenerateProjectReport.py (and anyone reproducing the paper's numbers)
-    can see exactly which model was chosen and why, without re-deriving it.
+    Rule: highest mean Balanced Accuracy across the projects' comparison_table.csv (Dummy baselines excluded);
+    ties broken by mean within-project rank, then alphabetically.
+    Returns a dict (primary_model, top3_models_for_lopo, ranking, ...) and writes '<export_dir>/primary_model_selection.json'.
     """
     if candidate_models is None:
         candidate_models = CANDIDATE_MODEL_NAMES
@@ -2330,8 +1808,7 @@ def select_primary_model(projects, export_dir, candidate_models=None):
     mean_ba = all_df.groupby("Model")["Balanced Accuracy"].mean().sort_values(ascending=False)
     project_counts = all_df.groupby("Model")["Project"].nunique()
 
-    # Mean rank (1 = best) per model within each project, then averaged - used
-    # only to break exact ties in mean_ba deterministically.
+    # Mean within-project rank (1 = best), used only to break ties
     all_df["Rank_In_Project"] = all_df.groupby("Project")["Balanced Accuracy"].rank(ascending=False, method="min")
     mean_rank = all_df.groupby("Model")["Rank_In_Project"].mean()
 
@@ -2381,22 +1858,12 @@ def select_primary_model(projects, export_dir, candidate_models=None):
 
 
 if __name__ == "__main__":
-    # ====================== Configurable Settings ======================
-    # Only change this section for each new batch of projects!
-    # Project names must match the folder names used by the previous steps
-    # (2-CalculateCodeMetrics.py, 3-ExtractHistoricalChanges.py, etc.), since
-    # this script only reads the .pkl files they already produced.
+    # Settings: project names must match the folders created by the previous scripts
     PROJECTS = ["spring-framework", "elasticsearch", "hadoop"]
-    # ================================================================
 
     overall_start_time = time.time()
 
-    # ---------- PASS 1: main model comparison for every project ----------
-    # Produces each project's comparison_table.csv (Table 3), tuned_hyperparams
-    # JSON, calibration/McNemar/bootstrap, and feature importance. Does NOT
-    # yet run RQ1 ablation / Repeated CV / Alpha sensitivity - those need a
-    # "primary model" that can only be picked once every project's
-    # comparison_table.csv exists (see select_primary_model below).
+    # Pass 1: main model comparison for every project
     pipeline_cache = {}  # project_name -> (X, change_count, y_stability, full_df_for_reporting, project_dir, features_graph)
     for proj_idx, project_name in enumerate(PROJECTS):
         print(f"\n=== [{proj_idx + 1}/{len(PROJECTS)}] Starting project: {project_name} (main comparison) ===")
@@ -2405,8 +1872,7 @@ if __name__ == "__main__":
             if result is not None:
                 pipeline_cache[project_name] = result
         except Exception as e:
-            # Log and move on to the next project instead of aborting the
-            # whole batch if a single project fails.
+            # Continue with the next project if one fails
             logger.error(f"Pipeline failed for project '{project_name}': {e}")
             if console_log_buffer is not None and project_dir is not None:
                 save_console_log_to_file()
@@ -2416,26 +1882,14 @@ if __name__ == "__main__":
         print(f"=== [{done}/{len(PROJECTS)}] Finished project: {project_name} | "
               f"elapsed {elapsed:.1f}s | ETA for remaining projects: {eta:.1f}s ===")
 
-    # PERF FIX: LOPO's load_project_dataset() recomputes compute_graph_features()
-    # from scratch (up to ~1000s for the larger projects here) for every
-    # project - this reuses the SAME (X, change_count, y_stability, df) Pass 1
-    # already computed for each project instead, in the exact shape
-    # load_project_dataset() would have returned. Built once, reused for
-    # EVERY LOPO call below (one per top-3 model) - without this, multi-model
-    # LOPO would redo compute_graph_features() for every project once per
-    # model (3x the recomputation, not just the original 1x duplicate).
+    # Reuse the Pass 1 datasets for LOPO (avoids recomputing graph features)
     lopo_preloaded_datasets = {
         project_name: (X, change_count, y_stability, full_df_for_reporting)
         for project_name, (X, change_count, y_stability, full_df_for_reporting, _cached_project_dir, _cached_features_graph)
         in pipeline_cache.items()
     }
 
-    # ---------- Choose the PRIMARY MODEL (data-driven, not assumed) ----------
-    # See select_primary_model()'s docstring for the full rationale: this is
-    # the model held constant across RQ1 Ablation / Repeated CV / Alpha
-    # Sensitivity for ALL projects, chosen by mean Balanced Accuracy across
-    # the comparison_table.csv results Pass 1 just produced - instead of
-    # hardcoding RandomForest regardless of whether it actually wins.
+    # Choose the primary model (best mean balanced accuracy across projects)
     primary_model_name = None
     top3_models_for_lopo = ["RandomForest"]
     try:
@@ -2447,23 +1901,16 @@ if __name__ == "__main__":
         primary_model_name = "RandomForest"
         top3_models_for_lopo = ["RandomForest"]
 
-    # ---------- CROSS-PROJECT SUMMARY (mean +/- std per model across all projects) ----------
-    # Not used to pick the primary model (select_primary_model already did
-    # that above) - this is purely a reporting convenience so the paper's
-    # "how does each model do overall" table doesn't have to be built by
-    # hand from three separate comparison_table.csv files.
+    # Cross-project summary table (reporting only)
     try:
         build_cross_project_summary_table(PROJECTS, EXPORT_DIR)
     except Exception as e:
         logger.error(f"build_cross_project_summary_table failed: {e}")
 
-    # ---------- PASS 2: follow-up analyses, now that the primary model is known ----------
+    # Pass 2: follow-up analyses with the primary model
     for project_name, (X, change_count, y_stability, full_df_for_reporting, cached_project_dir, cached_features_graph) in pipeline_cache.items():
         print(f"\n=== Follow-up analyses for: {project_name} (model={primary_model_name}) ===")
-        # Reuse THIS project's own GridSearchCV-tuned hyperparameters for the
-        # primary model (captured in Pass 1) instead of a manually guessed
-        # config - falls back to {} (library defaults) if unavailable, e.g.
-        # the primary model failed to train for this project in Pass 1.
+        # Reuse this project's tuned hyperparameters for the primary model; fall back to library defaults
         primary_fixed_params = {}
         tuned_path = os.path.join(cached_project_dir, f"tuned_hyperparams_{project_name}.json")
         try:
@@ -2482,32 +1929,12 @@ if __name__ == "__main__":
             if console_log_buffer is not None:
                 save_console_log_to_file()
 
-    # STAGE-1 FIX: in addition to each project's own within-project (random
-    # split) results above, also run the cross-project Leave-One-Project-Out
-    # evaluation. Report BOTH numbers in the paper - within-project accuracy
-    # alone overstates how well the model generalizes, since classes from the
-    # same project are not independent observations (item #28).
-    #
-    # Runs for the TOP-3 models by mean Balanced Accuracy (see
-    # select_primary_model above), not just one - showing that the same
-    # generalization/degradation pattern across projects holds for more than
-    # one algorithm is evidence the pattern reflects the structural signal
-    # itself, not an artifact of one particular model. Each model gets its
-    # own 'lopo_cross_project_<model>.csv' in EXPORT_DIR.
+    # Leave-One-Project-Out evaluation for the top-3 models, reported alongside the within-project results
     for lopo_model_name in top3_models_for_lopo:
         print(f"\n=== LOPO cross-project evaluation (model={lopo_model_name}) ===")
         try:
-            # PERF FIX: reuses lopo_preloaded_datasets (built once, above, from
-            # Pass 1's pipeline_cache) instead of calling load_project_dataset()
-            # (which redoes compute_graph_features(), up to ~1000s for the
-            # larger projects - see that function's PERF FIX docstring). Without
-            # this, LOPO would recompute graph features from scratch for every
-            # project, AND do it again for each of the top-3 models below (3x
-            # the waste) - this eliminates that entirely.
+            # Reuse the Pass 1 datasets instead of recomputing graph features
             run_leave_one_project_out_pipeline(PROJECTS, model_name=lopo_model_name,
                                                preloaded_datasets=lopo_preloaded_datasets)
         except Exception as e:
             logger.error(f"LOPO cross-project evaluation failed for model '{lopo_model_name}': {e}")
-
-
-
