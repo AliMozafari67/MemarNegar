@@ -1,31 +1,23 @@
 """
-auto_select_cutoffs.py -- choose a temporal cutoff for every project automatically and
-store it in temporal_cutoffs.json, which temporal_config.py (and therefore scripts 0-5)
-reads. Run it ONCE, before 0-CoChange.py:
+auto_select_cutoffs.py -- automatically choose a temporal cutoff per project and store it in
+temporal_cutoffs.json (read by temporal_config.py and scripts 0-5). Run once, before 0-CoChange.py:
 
-    python auto_select_cutoffs.py                # all projects, default settings
-    python auto_select_cutoffs.py --dry-run      # only show the analysis
-    python auto_select_cutoffs.py --force        # overwrite already-stored cutoffs
+    python auto_select_cutoffs.py                # all projects
+    python auto_select_cutoffs.py --dry-run      # analysis only
+    python auto_select_cutoffs.py --force        # overwrite stored cutoffs
 
-SELECTION RULE (deterministic; state it in the paper)
------------------------------------------------------
-Candidates are month-end dates. For each candidate the script estimates, from ONE pass over
-the non-merge, Java-touching commits of the repository:
-  - months / commits of history before the cutoff       (co-change + static snapshot)
-  - months of history after the cutoff                  (target window)
-  - eligible classes: classes that exist at the cutoff (touched before it) and are changed
-    at least once afterwards -- the same population the pipeline ends up with
-  - the 80th percentile (Q80) of their post-cutoff change counts, and the number of classes
-    at/above it (the "unstable" class)
-A candidate is FEASIBLE only if all minimum requirements below hold. Among feasible
-candidates the one whose share of commits before the cutoff is closest to
-TARGET_BEFORE_FRACTION (default 0.70, i.e. ~70/30 temporal split) is chosen.
-If no candidate is feasible the project gets NO cutoff (nothing is silently relaxed) and the
-script reports which requirement failed most often; adjust the thresholds explicitly.
+Selection rule (deterministic)
+------------------------------
+Candidates are month-end dates, evaluated in one pass over non-merge, Java-touching commits.
+Per candidate we estimate: months/commits before and after the cutoff, eligible classes
+(touched before the cutoff and changed afterwards), the Q80 of their post-cutoff change counts,
+and the number of classes at/above Q80 ("unstable").
+A candidate is feasible only if all minimum requirements hold; among feasible candidates, the one
+whose before-cutoff commit share is closest to TARGET_BEFORE_FRACTION is chosen. If none is
+feasible, no cutoff is stored and the failing requirements are reported.
 
-Approximations: class identity = file path (renames not resolved), eligible-class set =
-classes touched before the cutoff. The final choice is re-verified with git itself
-(anchor commit + commit counts of both windows).
+Approximations: class identity = file path (renames not resolved). The final choice is
+re-verified with git (anchor commit and commit counts of both windows).
 """
 import os
 import sys
@@ -43,18 +35,18 @@ from temporal_config import AUTO_CUTOFFS_FILE, load_auto_cutoffs, resolve_cutoff
 DEFAULT_BASE_CODE_DIR = r"D:\proje\python\Payannameh\Source"
 DEFAULT_PROJECTS = ["spring-framework", "elasticsearch", "hadoop"]
 
-# ---- selection settings (all overridable from the command line) ----
+# Selection settings (overridable from the command line)
 TARGET_BEFORE_FRACTION = 0.70   # desired share of Java commits before the cutoff
-MIN_BEFORE_MONTHS = 24          # history needed before the cutoff
-MIN_AFTER_MONTHS = 12           # length of the prediction window
-MIN_BEFORE_COMMITS = 1000       # enough co-change evidence
-MIN_ELIGIBLE_CLASSES = 1000     # classes in the final dataset (approximation)
-MIN_Q80 = 3                     # Q80 threshold of change counts must be at least this
+MIN_BEFORE_MONTHS = 24
+MIN_AFTER_MONTHS = 12
+MIN_BEFORE_COMMITS = 1000
+MIN_ELIGIBLE_CLASSES = 1000
+MIN_Q80 = 3
 MIN_UNSTABLE = 100              # classes at/above Q80
 
 
 def load_java_commits(repo):
-    """One git-log pass -> sorted list of (datetime_utc, [java files]) for non-merge commits."""
+    """Return a time-sorted list of (datetime_utc, [java files]) for non-merge commits."""
     cmd = ["git", "-C", repo, "log", "--no-merges", "-M", "--name-only",
            "--pretty=format:%x00%cI", "--", "*.java"]
     out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
@@ -80,7 +72,7 @@ def month_ends(first, last):
     ends = []
     while (y, m) <= (last.year, last.month):
         ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
-        end = datetime(ny, nm, 1, tzinfo=timezone.utc) - timedelta(seconds=1)  # last second of month
+        end = datetime(ny, nm, 1, tzinfo=timezone.utc) - timedelta(seconds=1)
         ends.append(end)
         y, m = ny, nm
     return ends
@@ -100,8 +92,8 @@ def evaluate_candidates(commits, cfg):
     cands = [c for c in month_ends(first, last) if c < last]
     rows = []
     after_counts = Counter()
-    idx = n  # commits[idx:] are in the "after" window
-    for T in sorted(cands, reverse=True):          # move the cutoff backwards, growing "after"
+    idx = n  # commits[idx:] form the "after" window
+    for T in sorted(cands, reverse=True):  # move cutoff backwards, growing the "after" window
         while idx > 0 and commits[idx - 1][0] > T:
             idx -= 1
             after_counts.update(commits[idx][1])
@@ -131,6 +123,7 @@ def choose(rows, cfg):
     feasible = [r for r in rows if not r["fails"]]
     if not feasible:
         return None
+    # Closest to the target split; ties go to the later cutoff
     return min(feasible, key=lambda r: (abs(r["before_fraction"] - cfg["target_before_fraction"]),
                                         -r["cutoff"].timestamp()))
 
