@@ -1,0 +1,420 @@
+"""
+Standalone script for extracting real cont-change data from Git that changed together
+in that same commit
+--------------------------------------------------
+This script is completely standalone and only needs the project's Git repo —
+it has no dependency on dependency_graph.pkl, propagation_frequencies.pkl,
+or any of the outputs of script1/script2/script4.
+
+Goal: for each commit, find the list of Java classes that changed together
+in that same commit, and for each pair of classes, count how many times
+they appeared together. This is the real "co-change frequency" that is
+used in the next stage to calibrate the edge weights of the
+Monte Carlo simulation.
+
+Output: co_change_counts.pkl in each project's folder, containing a dictionary:
+    { (class_a, class_b): number of times they changed together }
+    The keys are not sorted as a frozenset but as a sorted tuple,
+    so that (A,B) and (B,A) are counted as the same pair.
+
+How to run: just change the settings below for each project and run.
+"""
+
+import os
+import pickle
+import logging
+from collections import defaultdict
+from itertools import combinations
+
+import subprocess
+
+from temporal_config import get_cutoff, resolve_cutoff_commit, write_cutoff_marker
+
+# ====================== Settings (list of projects) ======================
+BASE_CODE_DIR = r"D:\proje\python\Payannameh\Source"   # Folder that contains each project's subfolder
+PROJECTS = ["spring-framework", "elasticsearch", "hadoop"]
+SINCE_DATE = None   # e.g. "2018-01-01" or None for the entire history
+
+# STAGE-1 TEMPORAL-SPLIT FIX (critique items #1, #2, #10, #14): co-change
+# counts feed propagation_frequency, which is a MODEL FEATURE. If it is
+# built from the entire Git history (including commits after the point in
+# time the target/label is measuring), the feature leaks future information
+# about the exact same history the target is derived from, which is target
+# leakage even though train_test_split is applied afterwards - the split
+# happens too late to remove it.
+#
+# TEMPORAL_CUTOFF_DATE now lives in temporal_config.py (single source,
+# shared with 3-ExtractHistoricalChanges.py) instead of being duplicated
+# here. Edit it there, not here. Leave as None to reproduce the old
+# (leaky) full-history behavior, e.g. for comparison.
+
+# To avoid a computational explosion: commits that changed more than this
+# number of Java files at once are ignored (these are usually merge/format-wide
+# commits and don't show meaningful co-change)
+MAX_FILES_PER_COMMIT = 30
+
+# Number of top frequent pairs shown in the aggregate report for each project
+TOP_N = 30
+# ==============================================================================
+
+EXPORT_DIR = "ExportFiles"
+os.makedirs(EXPORT_DIR, exist_ok=True)
+# Final aggregate file where the results of all three projects are written one after another
+AGGREGATE_TXT_OUTPUT = os.path.join(EXPORT_DIR, "co_change_summary_all_projects.txt")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+def get_class_name_from_path(file_path, repo_root):
+    """
+    STAGE-1 ENTITY-RESOLUTION FIX:
+    Previously this function collapsed the fully-qualified, path-based class
+    name down to just the last segment (e.g. 'org.a.UserService' -> 'UserService'),
+    "so it would match the simple-name nodes in dependency_graph.pkl". That
+    silently merged unrelated classes with the same simple name from different
+    packages (org.apache.A.UserService, org.elasticsearch.B.UserService,
+    com.foo.C.UserService would all collapse into a single 'UserService'
+    node and their co-change/change counts would be summed together) — a
+    genuine entity-resolution error.
+
+    We now return the FULLY-QUALIFIED, path-based name (package.ClassName),
+    exactly matching get_class_name_from_relpath() in the historical-changes
+    script, so that co-change identity, historical-change identity, and
+    (after the matching fix in the dependency-graph script) structural/graph
+    identity are all keyed on the same unambiguous entity.
+    """
+    try:
+        rel_path = os.path.relpath(file_path, repo_root)
+        if not rel_path.endswith(".java"):
+            return None
+        long_name = rel_path.replace(os.sep, '.').replace('/', '.')[:-5]
+        return long_name  # fully-qualified, path-based identity (no more split('.')[-1])
+    except Exception:
+        return None
+
+
+def ensure_safe_directory(code_dir):
+    """
+    Fixes Git's 'dubious ownership' error.
+    Instead of writing to the global config file (which GitPython might not see),
+    we use an environment variable that is passed directly to the git process —
+    more reliable and independent of PATH or the config file path.
+    """
+    os.environ["GIT_CONFIG_COUNT"] = "1"
+    os.environ["GIT_CONFIG_KEY_0"] = "safe.directory"
+    os.environ["GIT_CONFIG_VALUE_0"] = "*"   # Allows any path; fine since you're running this on your own system
+
+    # In addition, also try writing to the global config as a fallback
+    try:
+        result = subprocess.run(
+            ["git", "config", "--global", "--add", "safe.directory", code_dir],
+            check=False, capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            logger.warning(f"Writing to the global config failed (ignored): {result.stderr.strip()}")
+    except FileNotFoundError:
+        logger.warning("The git command was not found in PATH; only the environment variable will be used.")
+    except Exception as e:
+        logger.warning(f"Attempt to write global config failed (ignored): {e}")
+
+
+def git_relpath_to_fqn(git_relpath):
+    """Converts a repo-relative path AS REPORTED BY GIT (always '/'-separated,
+    already relative to repo root) directly to the fully-qualified,
+    path-based class identity. Distinct from get_class_name_from_path(),
+    which expects a real filesystem path and repo_root and calls
+    os.path.relpath - not appropriate for paths that come straight out of
+    'git log' output (which are already repo-relative)."""
+    if not git_relpath.endswith(".java"):
+        return None
+    return git_relpath.replace("/", ".")[:-5]
+
+
+def _build_rename_resolution_map(rename_pairs):
+    """
+    STAGE-3 FIX (critique item #13): builds old_path -> CANONICAL(final)_path
+    resolution, following rename chains (A renamed to B, B later renamed to
+    C => A and B both resolve to C). This lets historical activity on an old
+    name be correctly attributed to the same entity's current name, which is
+    also the identity used by the (current-snapshot) dependency-graph and
+    code-metrics scripts - so identities line up end-to-end.
+    Uses git's own rename detection (-M, i.e. 'R' status lines) rather than
+    the per-file '--follow' flag, since '--follow' only works for a single
+    path query at a time and is impractical for a bulk whole-history walk.
+    """
+    direct_map = dict(rename_pairs)  # old -> new (last-seen wins if a path was renamed more than once)
+
+    def resolve(path, _seen=None):
+        _seen = _seen or set()
+        steps = 0
+        while path in direct_map and path not in _seen and steps < 100:
+            _seen.add(path)
+            path = direct_map[path]
+            steps += 1
+        return path
+
+    return resolve
+
+
+def extract_cochange(code_dir, since=SINCE_DATE, until=None,
+                     max_files_per_commit=MAX_FILES_PER_COMMIT):
+    """
+    Fast approach: instead of a separate git diff call for each commit (which is
+    very slow for tens of thousands of commits since a new external process is
+    opened and closed each time), we get the entire history with a single
+    'git log' call and process it in Python.
+
+    STAGE-3 FIX (critique item #12): merge commits are excluded via
+    --no-merges HERE, and the historical-changes script now also uses
+    --no-merges - both evolutionary measures share the SAME explicit merge
+    policy: "all merge commits are excluded from both co-change and
+    historical-change counting" (state this verbatim in the paper).
+
+    STAGE-3 FIX (critique item #13): uses 'git log --name-status -M' instead
+    of '--name-only', so renames are detected (R<score> status lines) and
+    resolved to their final/current path before counting, instead of
+    silently splitting one evolving class's history across two identities.
+
+    STAGE-1 TEMPORAL-SPLIT FIX: 'until', if set, restricts co-change (and
+    therefore the propagation-frequency feature built from it) to commits up
+    to that date, so it cannot see the same future window the historical
+    change target is measuring. Must match TEMPORAL_CUTOFF_DATE used in the
+    historical-changes script's "after" window.
+    """
+    logger.info("Opening the Git repository...")
+    ensure_safe_directory(code_dir)
+
+    if not os.path.isdir(os.path.join(code_dir, ".git")):
+        logger.error(f"The .git folder was not found in '{code_dir}'.")
+        return {}, {}
+
+    marker = "\x01"  # Unique separator between commits, so it doesn't clash with file names
+    cmd = [
+        "git", "-C", code_dir, "log", "--no-merges", "-M", "--name-status",
+        f"--pretty=format:{marker}",
+    ]
+    if since:
+        cmd.append(f"--since={since}")
+    if until:
+        # `until` is the cutoff datetime, resolved to an anchor commit. The window is
+        # "all commits reachable from the anchor": the exact complement of script 3's
+        # "anchor..HEAD" target window, so no commit can fall in both.
+        anchor = resolve_cutoff_commit(code_dir, until)
+        if not anchor:
+            raise RuntimeError(f"No commit found at or before cutoff {until} in '{code_dir}'.")
+        cmd.append(anchor)
+        logger.info(f"Cutoff {until} -> anchor commit {anchor}: co-change limited to commits reachable "
+                    f"from it (propagation_frequency cannot see the target window).")
+    cmd += ["--", "*.java"]
+
+    logger.info("Running 'git log' once for the entire history (may take a few minutes)...")
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env=os.environ.copy(),
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        logger.error("The git command was not found. Make sure git is installed and in PATH.")
+        return {}, {}
+
+    # --- Pass 1: buffer raw per-commit status lines and collect rename pairs ---
+    raw_commits = []  # list of list[(status, path_or_paths)]
+    rename_pairs = []
+    current_lines = []
+    unparseable_status_lines = 0
+
+    def flush_raw(lines):
+        raw_commits.append(list(lines))
+
+    for line in iter(proc.stdout.readline, ""):
+        line = line.rstrip("\n")
+        if line == marker:
+            flush_raw(current_lines)
+            current_lines = []
+        elif line.strip():
+            current_lines.append(line)
+    flush_raw(current_lines)
+
+    proc.stdout.close()
+    proc.wait()
+    if proc.returncode != 0:
+        logger.error(f"git log returned an error (code {proc.returncode})")
+        return {}, {}
+
+    for lines in raw_commits:
+        for entry in lines:
+            parts = entry.split("\t")
+            status = parts[0]
+            if status.startswith("R") or status.startswith("C"):
+                if len(parts) == 3:
+                    old_path, new_path = parts[1], parts[2]
+                    if status.startswith("R"):  # true rename: old identity ceases to exist -> resolve to new
+                        rename_pairs.append((old_path, new_path))
+                    # 'C' (copy) is NOT a rename - old_path keeps existing as its own class,
+                    # so it is intentionally not added to rename_pairs.
+                else:
+                    unparseable_status_lines += 1
+
+    resolve_fqn_path = _build_rename_resolution_map(rename_pairs)
+    if rename_pairs:
+        logger.info(f"Detected {len(rename_pairs)} rename events; historical identity will be "
+                    f"resolved to each file's final/current path (Stage-3 rename-tracking fix).")
+
+    # --- Pass 2: build cochange counts using rename-resolved identities ---
+    cochange_counts = defaultdict(int)
+    class_solo_counts = defaultdict(int)
+    skipped_wide_commits = 0
+    processed_commits = 0
+    unresolved_class_name_paths = 0
+
+    def flush_commit(lines):
+        nonlocal skipped_wide_commits, unresolved_class_name_paths
+        classes = set()
+        for entry in lines:
+            parts = entry.split("\t")
+            status = parts[0]
+            if status.startswith("R") or status.startswith("C"):
+                path = parts[2] if len(parts) == 3 else None
+            else:
+                path = parts[1] if len(parts) == 2 else None
+            if not path or not path.endswith(".java"):
+                continue
+            resolved_path = resolve_fqn_path(path)
+            cname = git_relpath_to_fqn(resolved_path)
+            if cname:
+                classes.add(cname)
+            else:
+                unresolved_class_name_paths += 1
+        if not classes:
+            return
+        if len(classes) > max_files_per_commit:
+            skipped_wide_commits += 1
+            return
+        for cname in classes:
+            class_solo_counts[cname] += 1
+        for a, b in combinations(sorted(classes), 2):
+            cochange_counts[(a, b)] += 1
+
+    for lines in raw_commits:
+        flush_commit(lines)
+        processed_commits += 1
+        if processed_commits % 5000 == 0:
+            logger.info(f"...{processed_commits} commits processed")
+
+    logger.info(f"Total commits processed (excluding merges): {processed_commits}")
+    logger.info(f"Large commits (more than {max_files_per_commit} files) ignored: {skipped_wide_commits}")
+    logger.info(f"Number of class pairs with co-change: {len(cochange_counts)}")
+
+    # STAGE-3 FIX (critique item #26): explicit, saved parsing statistics
+    # instead of only console diagnostics, so exclusion rates can be
+    # reported per project in the paper.
+    parsing_stats = {
+        'total_commits_examined': processed_commits,
+        'rename_events_detected': len(rename_pairs),
+        'skipped_wide_commits': skipped_wide_commits,
+        'max_files_per_commit_threshold': max_files_per_commit,
+        'unresolved_status_lines': unparseable_status_lines,
+        'paths_that_failed_fqn_conversion': unresolved_class_name_paths,
+        'unique_classes_with_cochange_data': len(class_solo_counts),
+        'unique_cochanging_class_pairs': len(cochange_counts),
+    }
+    try:
+        project_dir_for_stats = os.path.join(EXPORT_DIR, os.path.basename(os.path.normpath(code_dir)))
+        os.makedirs(project_dir_for_stats, exist_ok=True)
+        with open(os.path.join(project_dir_for_stats, "parsing_stats_cochange.pkl"), "wb") as f:
+            pickle.dump(parsing_stats, f)
+    except Exception as e:
+        logger.warning(f"Could not save co-change parsing stats: {e}")
+
+    return dict(cochange_counts), dict(class_solo_counts)
+
+
+def main():
+    # If an aggregate file remains from a previous run, start fresh
+    if os.path.exists(AGGREGATE_TXT_OUTPUT):
+        os.remove(AGGREGATE_TXT_OUTPUT)
+
+    summary_lines = []  # Final summary of all projects, to be written at the end of the file
+
+    for project_name in PROJECTS:
+        code_dir = os.path.join(BASE_CODE_DIR, project_name)
+        project_dir = os.path.join(EXPORT_DIR, project_name)
+        os.makedirs(project_dir, exist_ok=True)
+        pkl_output = os.path.join(project_dir, "co_change_counts.pkl")
+
+        logger.info("=" * 70)
+        logger.info(f"Starting co-change extraction for project: {project_name}")
+        logger.info(f"Repo path: {code_dir}")
+
+        cutoff = get_cutoff(project_name)          # raises if no cutoff is configured
+        anchor_commit = resolve_cutoff_commit(code_dir, cutoff) if cutoff else None
+        cochange_counts, class_solo_counts = extract_cochange(code_dir, SINCE_DATE, cutoff)
+
+        with open(AGGREGATE_TXT_OUTPUT, "a", encoding="utf-8") as f:
+            f.write("=" * 70 + "\n")
+            f.write(f"Project: {project_name}\n")
+            f.write(f"Repo path: {code_dir}\n")
+            f.write("=" * 70 + "\n")
+
+            if not cochange_counts:
+                msg = "No co-change found! This project was skipped."
+                logger.error(msg)
+                f.write(msg + "\n\n")
+                summary_lines.append(f"- {project_name}: failed (no co-change)")
+                continue
+
+            # Save the pkl specific to this project
+            with open(pkl_output, "wb") as pf:
+                pickle.dump({
+                    "cochange_counts": cochange_counts,
+                    "class_solo_counts": class_solo_counts,
+                }, pf)
+            logger.info(f"pkl results saved to '{pkl_output}'.")
+
+            marker_path = write_cutoff_marker(project_dir, "cochange", cutoff, anchor_commit)
+            logger.info(f"Cutoff marker written to '{marker_path}' "
+                        f"(temporal_cutoff_date={cutoff!r}, anchor={anchor_commit}); "
+                        f"4-MLPipeline.py will check this against script 3's marker.")
+
+            total_pairs = len(cochange_counts)
+            total_classes = len(class_solo_counts)
+            top_pairs = sorted(cochange_counts.items(), key=lambda x: x[1], reverse=True)[:TOP_N]
+
+            f.write(f"Total classes seen: {total_classes}\n")
+            f.write(f"Total class pairs with co-change: {total_pairs}\n")
+            f.write(f"pkl file: {pkl_output}\n")
+            f.write(f"\nTop {TOP_N} most frequent pairs:\n")
+            f.write(f"{'class_a':<40}{'class_b':<40}{'count'}\n")
+            for (a, b), count in top_pairs:
+                f.write(f"{a:<40}{b:<40}{count}\n")
+            f.write("\n\n")
+
+            logger.info(f"Summary of project '{project_name}' written to the aggregate file.")
+            best_pair, best_count = top_pairs[0]
+            summary_lines.append(
+                f"- {project_name}: {total_classes} classes, {total_pairs} co-change pairs, "
+                f"most frequent: {best_pair[0]} <-> {best_pair[1]} ({best_count} times)"
+            )
+
+    # Write the overall summary at the end of the file
+    with open(AGGREGATE_TXT_OUTPUT, "a", encoding="utf-8") as f:
+        f.write("=" * 70 + "\n")
+        f.write("Overall summary of all projects\n")
+        f.write("=" * 70 + "\n")
+        for line in summary_lines:
+            f.write(line + "\n")
+
+    logger.info("=" * 70)
+    logger.info(f"Processing of all projects finished. Aggregate report: '{AGGREGATE_TXT_OUTPUT}'")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
