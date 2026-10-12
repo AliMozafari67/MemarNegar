@@ -1,24 +1,21 @@
 import os
-import networkx as nx
 import random
 import pickle
+import logging
+import subprocess
+from collections import deque, defaultdict
+
+import networkx as nx
 import numpy as np
 import pandas as pd
-from collections import deque, defaultdict
-import logging
 import javalang
 
-# STAGE-4 FIX (critique item #8): this script previously had NO awareness of
-# TEMPORAL_CUTOFF_DATE at all - it always read whatever commit code_dir
-# happens to be checked out to on disk (i.e. HEAD), regardless of which
-# temporal window the target labels come from. git_snapshot_at (defined
-# further below, after `logger` exists) temporarily checks the repo out to
-# the exact commit as of TEMPORAL_CUTOFF_DATE for the duration of graph
-# construction, then restores the original branch/commit.
 from temporal_config import get_cutoff, resolve_cutoff_commit, write_cutoff_marker
+
 
 class InfoFilter(logging.Filter):
     def filter(self, record): return record.levelno == logging.INFO
+
 
 logger = logging.getLogger('ccn_calculator')
 logger.setLevel(logging.INFO)
@@ -36,22 +33,11 @@ logger.handlers = []
 logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
-# ============================================================
-# STAGE-4 FIX (critique item #8): inlined from git_snapshot_utils.py so
-# everything lives in one file. See the class docstring for details.
-# ============================================================
-import subprocess as _subprocess_for_git_snapshot
-
 
 class git_snapshot_at:
-    """
-    Context manager: checks out `code_dir`'s git repo to the last commit at
-    or before `cutoff_date` (a "YYYY-MM-DD" string) for the duration of the
-    `with` block, then restores the original HEAD/branch afterward - even
-    if an exception occurs inside the block.
+    """Context manager: check out the last commit at/before `cutoff_date`, then restore the original ref.
 
-    If cutoff_date is None (temporal mode not enabled), this is a no-op: it
-    leaves the repo exactly as it is, so non-temporal runs are unaffected.
+    The original HEAD/branch is restored even if an exception occurs. If cutoff_date is None, it is a no-op.
     """
 
     def __init__(self, code_dir, cutoff_date):
@@ -62,15 +48,11 @@ class git_snapshot_at:
         self._active = cutoff_date is not None
 
     def _run(self, *args):
-        result = _subprocess_for_git_snapshot.run(
+        result = subprocess.run(
             ["git", "-C", self.code_dir, *args],
             capture_output=True, text=True, check=True
         )
         return result.stdout.strip()
-
-    @staticmethod
-    def _is_hash(ref):
-        return len(ref) in (7, 8, 9, 10, 11, 12, 40) and all(c in "0123456789abcdef" for c in ref.lower())
 
     def __enter__(self):
         if not self._active:
@@ -88,7 +70,7 @@ class git_snapshot_at:
                 f"uncommitted work."
             )
 
-        # Same anchor definition as scripts 0 and 3 (temporal_config.resolve_cutoff_commit).
+        # Same anchor definition as scripts 1 and 3
         self._commit_at_cutoff = resolve_cutoff_commit(self.code_dir, self.cutoff_date, "HEAD")
         if not self._commit_at_cutoff:
             raise RuntimeError(
@@ -113,52 +95,26 @@ class git_snapshot_at:
     def commit_hash(self):
         return self._commit_at_cutoff
 
+
 JAVA_STD_LIB_PREFIXES = ("java.", "javax.", "sun.")
 
-# ====================== Structural + Behavioral Weight Combination Settings ======================
-# Final edge weight = ALPHA_STRUCTURAL * structural weight (normalized) + (1 - ALPHA_STRUCTURAL) * co-change behavioral weight (normalized)
-# If the co_change_counts.pkl file is not found, only the structural weight is used automatically (backward compatible).
-#
-# STAGE-3 FIX (critique item #9): 0.6 is still an uncalibrated heuristic
-# choice - do not report it in the paper without running
-# run_alpha_sensitivity_sweep() (below) across ALPHA_SENSITIVITY_GRID first
-# and citing the resulting sensitivity tables in Threats to Validity.
+# ====================== Settings ======================
+# Final edge weight = ALPHA_STRUCTURAL * structural + (1 - ALPHA_STRUCTURAL) * co-change (both normalized).
+# Without co_change_counts.pkl, only the structural weight is used.
 ALPHA_STRUCTURAL = 0.6
-# STAGE-4 FIX (critique item #9): the sweep infrastructure below was written
-# but never actually executed (this flag was left False). Set to True so the
-# paper's alpha=0.6 choice is backed by an actual sensitivity analysis
-# instead of being reported as an untested heuristic. This makes main() run
-# the full graph+propagation pipeline once per alpha value in
-# ALPHA_SENSITIVITY_GRID (11 values) for every project - budget the extra
-# wall-clock time accordingly, or shrink the grid below if needed.
+# If True, the full pipeline also runs once per alpha in ALPHA_SENSITIVITY_GRID (extra runtime)
 RUN_ALPHA_SENSITIVITY = True
-# ==================================================================================
 
-# ====================== Batch Settings (run all projects automatically) ======================
-# Folder that contains each project's subfolder (same convention as the co-change script).
 BASE_CODE_DIR = r"D:\proje\python\Payannameh\Source"
 PROJECTS = ["spring-framework", "elasticsearch", "hadoop"]
-# ==================================================================================
+# ======================================================
+
 
 def normalize_weights_robust(raw_values, clip_percentile=99, logger_=None, label=""):
-    """
-    Robust replacement for naive `value / max(value)` normalization.
+    """Robust normalization: log1p, then cap at a high percentile instead of the raw max.
 
-    Problem this fixes: a plain division by the global max is extremely
-    sensitive to a handful of outlier edges/pairs (e.g. a class that
-    references a common utility type dozens of times, or two files that
-    co-changed in nearly every commit). One such outlier crushes almost
-    every other value toward ~0, which starves the downstream Monte Carlo
-    propagation simulation of any real signal (edges rarely "fire").
-
-    Fix: compress the long tail with log1p, then cap at a high percentile
-    (default 99th) instead of the raw max, and clip to [0,1]. Relative
-    ordering of typical (non-outlier) values is preserved; only the most
-    extreme outliers get pulled in, so the bulk of the distribution keeps
-    meaningful spread instead of being pinned near zero.
-
-    raw_values: iterable of non-negative numbers (dict.values() is fine).
-    Returns (cap, log1p_values_array) — cap is logged for traceability.
+    Prevents a few outliers from pushing all other values toward zero.
+    Returns (cap, log1p_values_array).
     """
     arr = np.asarray(list(raw_values), dtype=float)
     if arr.size == 0:
@@ -179,9 +135,7 @@ def normalize_weights_robust(raw_values, clip_percentile=99, logger_=None, label
 
 
 def log_distribution(values, logger_, label):
-    """Diagnostic helper: logs count/min/median/mean/p95/max/CV for a
-    collection of numeric feature values, so weight/propagation
-    distributions can be inspected without a separate script."""
+    """Log count/min/median/mean/p95/max/CV of numeric values."""
     arr = np.asarray(list(values), dtype=float)
     if arr.size == 0:
         logger_.warning(f"[{label}] distribution: no values to summarize.")
@@ -198,13 +152,7 @@ def log_distribution(values, logger_, label):
 
 
 def get_fqn_from_path(file_path, repo_root):
-    """
-    Path-based fully-qualified class identity (package.ClassName), consistent
-    with get_class_name_from_path() in the co-change script and
-    get_class_name_from_relpath() in the historical-changes script.
-    STAGE-1 ENTITY-RESOLUTION FIX: this is now the canonical node identity
-    for the dependency graph, instead of the bare simple class name.
-    """
+    """Path-based fully-qualified class identity (package.ClassName), the graph's node identity."""
     try:
         rel_path = os.path.relpath(file_path, repo_root)
         if not rel_path.endswith(".java"):
@@ -215,16 +163,7 @@ def get_fqn_from_path(file_path, repo_root):
 
 
 def build_simple_name_index(code_dir):
-    """
-    First pass over the source tree: maps each simple class name (e.g.
-    'UserService') to the list of fully-qualified identities that share
-    that simple name in this codebase (e.g. ['org.a.UserService',
-    'org.b.UserService']). Built purely from file paths, no parsing
-    required. Used to disambiguate unqualified type references found
-    inside method bodies, since javalang does not do full symbol
-    resolution and a bare 'UserService' reference could point to any of
-    several in-repo classes.
-    """
+    """Map each simple class name to the list of FQNs sharing it (built from file paths only)."""
     index = defaultdict(list)
     for root, _, files in os.walk(code_dir):
         for file in files:
@@ -236,22 +175,10 @@ def build_simple_name_index(code_dir):
 
 
 def resolve_dependency_identity(dep_simple_name, import_map, simple_name_index):
-    """
-    STAGE-1 ENTITY-RESOLUTION FIX.
-    Previously a dependency edge target was identified purely by its bare,
-    unqualified simple name, so two unrelated classes sharing a simple name
-    in different packages (or a user class that happens to share a name
-    with a JDK/library type) were silently merged into a single graph node.
-    This instead resolves each reference, in order of confidence:
-      1. An exact match among this file's import statements (unambiguous,
-         since Java imports are fully qualified).
-      2. A UNIQUE match in the project-wide simple-name index (only one
-         in-repo class has this simple name, so it is safe to resolve).
-      3. Otherwise, the reference is either an external/JDK/library type or
-         a genuinely ambiguous in-repo name; rather than silently guessing
-         (and risking merging two different repo classes), it is tagged
-         with a distinct 'EXTERNAL::' namespace so it can never collide
-         with a real in-repo class node.
+    """Resolve a simple type name to an unambiguous identity.
+
+    Order: exact import match -> unique in-repo simple name -> 'EXTERNAL::<name>'
+    (external or ambiguous; never collides with an in-repo node).
     """
     if dep_simple_name in import_map:
         return import_map[dep_simple_name]
@@ -263,7 +190,7 @@ def resolve_dependency_identity(dep_simple_name, import_map, simple_name_index):
 
 def extract_dependencies_javalang(file_path, repo_root, simple_name_index):
     dependencies = defaultdict(int)
-    class_name = None  # bare simple name, used only to locate the primary type node in this file's AST
+    class_name = None  # simple name, only used to find the primary type in this file's AST
     try:
         with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
         tree = javalang.parse.parse(content)
@@ -273,8 +200,7 @@ def extract_dependencies_javalang(file_path, repo_root, simple_name_index):
                 break
         if not class_name: return None, {}
 
-        # Build this file's import map (simple name -> fully-qualified import
-        # path) for STAGE-1 dependency resolution below.
+        # simple name -> fully-qualified import path
         import_map = {}
         try:
             for imp in tree.imports:
@@ -335,10 +261,6 @@ def extract_dependencies_javalang(file_path, repo_root, simple_name_index):
         return None, {}
     primitives = {'byte', 'short', 'int', 'long', 'float', 'double', 'boolean', 'char', 'void', 'String'}
 
-    # STAGE-1 ENTITY-RESOLUTION FIX: subject identity is the path-based FQN;
-    # each dependency's bare simple name is resolved to an unambiguous
-    # identity (import match / unique in-repo match / namespaced external)
-    # instead of being left as a collidable bare simple name.
     subject_fqn = get_fqn_from_path(file_path, repo_root)
     if not subject_fqn:
         return None, {}
@@ -352,6 +274,7 @@ def extract_dependencies_javalang(file_path, repo_root, simple_name_index):
 
     return subject_fqn, filtered_deps
 
+
 def build_ccn(code_dir, project_name):
     graph = nx.DiGraph()
     logger.info("Starting CCN construction...")
@@ -360,9 +283,6 @@ def build_ccn(code_dir, project_name):
     project_dir = os.path.join(EXPORT_DIR, project_name)
     os.makedirs(project_dir, exist_ok=True)
 
-    # STAGE-1 ENTITY-RESOLUTION FIX: build the simple-name -> FQN index once
-    # up front so dependency references can be resolved to unambiguous
-    # in-repo identities (see resolve_dependency_identity docstring).
     logger.info("Building project-wide simple-name index for entity resolution...")
     simple_name_index = build_simple_name_index(code_dir)
     ambiguous_names = {k: v for k, v in simple_name_index.items() if len(v) > 1}
@@ -385,11 +305,7 @@ def build_ccn(code_dir, project_name):
                 processed_files += 1
                 if not graph.has_node(class_name): graph.add_node(class_name)
                 for dep, count in deps.items():
-                    # External/unresolved references (JDK, third-party libs, or
-                    # genuinely ambiguous in-repo names) are not added as graph
-                    # nodes: they don't correspond to a specific in-repo class,
-                    # so a node for them would carry no code-metrics/history and
-                    # could only ever pollute centrality/propagation features.
+                    # Skip external/ambiguous references: they have no metrics or history
                     if dep.startswith("EXTERNAL::") or dep.startswith(JAVA_STD_LIB_PREFIXES):
                         continue
                     if not graph.has_node(dep): graph.add_node(dep)
@@ -410,7 +326,6 @@ def build_ccn(code_dir, project_name):
             edges_list = list(graph.edges(data=True))
             all_weights = [d['weight'] for _, _, d in edges_list]
             if all_weights:
-                # --- DIAGNOSTIC: raw weight distribution before any normalization ---
                 log_distribution(all_weights, logger, "raw_structural_weight (pre-normalization)")
 
                 if max(all_weights) > 0:
@@ -418,11 +333,10 @@ def build_ccn(code_dir, project_name):
                         all_weights, clip_percentile=99, logger_=logger, label="structural_weight"
                     )
                     for (u, v, d), lw in zip(edges_list, log_weights):
-                        # Keep the normalized structural weight separate so it can be combined with the behavioral weight later
+                        # Keep the structural weight separate for later combination with the behavioral weight
                         d['structural_weight'] = float(np.clip(lw / cap, 0, 1))
                         d['weight'] = d['structural_weight']
 
-                    # --- DIAGNOSTIC: distribution after robust normalization ---
                     log_distribution(
                         [d['structural_weight'] for _, _, d in graph.edges(data=True)],
                         logger, "structural_weight (post log1p+p99 normalization)"
@@ -450,13 +364,9 @@ def build_ccn(code_dir, project_name):
 
 
 def load_cochange_counts(project_dir):
-    """
-    Reads the co_change_counts.pkl file produced by the standalone co-change script.
-    File structure: {"cochange_counts": {(class_a, class_b): count, ...}, "class_solo_counts": {...}}
-    The keys of cochange_counts are a sorted tuple of the two classes'
-    fully-qualified, path-based identities (STAGE-1 entity-resolution fix) —
-    exactly the same node identity convention used in build_ccn.
-    If the file does not exist, returns None so the process can continue without error, using only the structural weight.
+    """Load cochange_counts ({(class_a, class_b): count}) from co_change_counts.pkl.
+
+    Returns None if the file is missing, empty or unreadable (structural weight only).
     """
     cochange_file = os.path.join(project_dir, "co_change_counts.pkl")
     if not os.path.exists(cochange_file):
@@ -480,22 +390,16 @@ def load_cochange_counts(project_dir):
 
 
 def combine_structural_and_behavioral_weights(graph, cochange_counts, alpha=ALPHA_STRUCTURAL):
-    """
-    Builds the final weight of each edge by combining the structural weight (from build_ccn,
-    already normalized to [0,1]) with the real co-change behavioral weight (from Git history):
+    """Set each edge weight to alpha * structural + (1 - alpha) * normalized co-change weight.
 
-        weight_final = alpha * structural_weight + (1 - alpha) * behavioral_weight_normalized
-
-    If cochange_counts is not available, the graph is returned unchanged (structural weight only).
+    Without cochange_counts, the structural weight is kept as the final weight.
     """
     if not cochange_counts:
-        # No behavioral data available; the structural weight becomes the final weight.
         for u, v, d in graph.edges(data=True):
             d.setdefault('structural_weight', d.get('weight', 0.0))
             d['behavioral_weight'] = 0.0
         return graph
 
-    # --- DIAGNOSTIC: raw co-change count distribution before normalization ---
     log_distribution(cochange_counts.values(), logger, "raw_cochange_counts (all pairs, pre-normalization)")
 
     cap, _ = normalize_weights_robust(
@@ -521,7 +425,6 @@ def combine_structural_and_behavioral_weights(graph, cochange_counts, alpha=ALPH
         f"Co-change behavioral weight found and combined for {matched_edges} of {graph.number_of_edges()} edges "
         f"(ALPHA_STRUCTURAL={alpha}, behavioral weight={1 - alpha:.2f})."
     )
-    # --- DIAGNOSTIC: distributions after combining, so you can see the final edge weights the simulation will use ---
     log_distribution(behavioral_weights_for_log, logger, "behavioral_weight (post log1p+p99 normalization, matched to graph edges)")
     log_distribution([d['weight'] for _, _, d in graph.edges(data=True)], logger, "FINAL combined edge weight (structural+behavioral)")
     return graph
@@ -563,40 +466,25 @@ def simulate_change_propagation(graph, base_simulations=50000, factor=10 , seed=
         for cls, count in propagation_counts.items():
             propagation_frequencies[cls] = count / num_simulations
     logger.info(f"Simulation completed. Propagation frequencies calculated for {len(propagation_frequencies)} classes.")
-    # --- DIAGNOSTIC: this is the number that matters most. If CV is low (e.g. < 0.3)
-    # and values cluster tightly around ~1/num_nodes, propagation is barely spreading
-    # beyond the randomly chosen start node and the feature will carry little signal. ---
+    # A low CV with values near 1/num_nodes means propagation barely spreads (weak feature signal)
     log_distribution(propagation_frequencies.values(), logger, "FINAL propagation_frequency (this is what feeds the model)")
     logger.info(f"For reference, uniform/no-propagation baseline would be ~{1.0 / max(num_nodes, 1):.5f} per class.")
     return propagation_frequencies
+
 
 ALPHA_SENSITIVITY_GRID = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
 
 def run_alpha_sensitivity_sweep(project_name, code_dir, alpha_grid=ALPHA_SENSITIVITY_GRID):
-    """
-    STAGE-3 FIX (critique item #9): ALPHA_STRUCTURAL=0.6 was previously an
-    unjustified constant. This rebuilds edge weights + propagation for every
-    alpha in alpha_grid (holding the raw structural/behavioral graph fixed,
-    only alpha varies) and saves:
-      - propagation_frequencies_alpha_<a>.pkl for each alpha (so the ML
-        pipeline's run_alpha_sensitivity_ml_analysis, in script 4, can
-        measure the actual downstream effect on prediction performance and
-        feature-importance/ranking stability, not just the raw distribution).
-      - alpha_sensitivity_propagation_distribution.csv: mean/median/p95/CV
-        of propagation_frequency at each alpha, so at minimum a reviewer can
-        see how much the propagation signal itself changes with alpha.
-    This does NOT by itself choose alpha for you or replace the ML-level
-    sensitivity analysis (performance / feature importance / ranking
-    stability) - see run_alpha_sensitivity_ml_analysis in script 4 for that.
+    """Rebuild edge weights and propagation for every alpha in alpha_grid.
+
+    Saves propagation_frequencies_alpha_<a>.pkl per alpha (used by script 4's ML sensitivity
+    analysis), a distribution summary CSV, and a Spearman rank-stability CSV.
     """
     project_dir = os.path.join(EXPORT_DIR, project_name)
     os.makedirs(project_dir, exist_ok=True)
 
     logger.info(f"[{project_name}] Building base dependency graph (structural weights only, alpha-independent)...")
-    # STAGE-4 FIX (critique item #8): same snapshot-consistency fix as
-    # process_project() - the alpha sweep must also use the code as it
-    # existed at the temporal cutoff, not whatever HEAD currently is.
     with git_snapshot_at(code_dir, get_cutoff(project_name)):
         base_graph = build_ccn(code_dir, project_name)
     if base_graph is None or base_graph.number_of_nodes() == 0:
@@ -629,9 +517,7 @@ def run_alpha_sensitivity_sweep(project_name, code_dir, alpha_grid=ALPHA_SENSITI
     dist_df.to_csv(csv_path, index=False)
     logger.info(f"[{project_name}] Alpha sensitivity propagation distribution saved to '{csv_path}'")
 
-    # Rank-stability: Spearman correlation of each alpha's propagation
-    # ranking against alpha=0.6 (the value actually used in the main
-    # pipeline), so a reviewer can see how sensitive the FINAL rankings are.
+    # Rank stability: Spearman correlation of each alpha's ranking vs the reference alpha (0.6)
     try:
         from scipy.stats import spearmanr
         ref_alpha = 0.6 if 0.6 in alpha_grid else alpha_grid[len(alpha_grid) // 2]
@@ -660,13 +546,9 @@ def run_alpha_sensitivity_sweep(project_name, code_dir, alpha_grid=ALPHA_SENSITI
 
 
 def process_project(project_name, code_dir):
-    """
-    Runs the full CCN-build + weight-combination + propagation-simulation
-    pipeline for a single project. Unchanged logic from before — only the
-    name changed (was `main`) so it can be called in a loop from the new
-    batch `main()` below.
-    Returns True on success, False if this project was skipped/failed
-    (so the batch runner can report a clean summary without stopping).
+    """Run graph build, weight combination and propagation simulation for one project.
+
+    Returns True on success, False if the project was skipped or failed.
     """
     project_dir = os.path.join(EXPORT_DIR, project_name)
     os.makedirs(project_dir, exist_ok=True)
@@ -677,12 +559,8 @@ def process_project(project_name, code_dir):
         logger.error(f"Code directory not found for project '{project_name}': '{code_dir}'. Skipping this project.")
         return False
 
-    # STAGE-4 FIX (critique item #8): build the graph from the code as it
-    # existed AT the temporal cutoff, not from whatever is currently checked
-    # out on disk. If TEMPORAL_CUTOFF_DATE is None, git_snapshot_at is a
-    # no-op and this behaves exactly as before.
     logger.info("Building dependency graph with javalang...")
-    cutoff = get_cutoff(project_name)          # raises if no cutoff is configured
+    cutoff = get_cutoff(project_name)  # raises if no cutoff is configured
     snap = git_snapshot_at(code_dir, cutoff)
     with snap:
         graph = build_ccn(code_dir, project_name)
@@ -690,11 +568,9 @@ def process_project(project_name, code_dir):
         logger.error(f"Graph construction failed or graph is empty for project '{project_name}'. Skipping.")
         return False
 
-    # ---- Combine structural (static) weight with behavioral weight (real co-change from Git) ----
     logger.info("Loading real co-change data to calibrate edge weights...")
     cochange_counts = load_cochange_counts(project_dir)
     graph = combine_structural_and_behavioral_weights(graph, cochange_counts, alpha=ALPHA_STRUCTURAL)
-    # -----------------------------------------------------------------------------
 
     write_cutoff_marker(project_dir, "graph", cutoff, snap.commit_hash)
     with open(graph_file, "wb") as f: pickle.dump(graph, f)
@@ -711,15 +587,9 @@ def process_project(project_name, code_dir):
 
 
 def main():
-    """
-    Batch entry point: runs process_project() for every project listed in
-    PROJECTS automatically, one after another. A failure on one project
-    (missing folder, empty graph, etc.) is logged and skipped rather than
-    stopping the whole batch, so the remaining projects still run.
+    """Run process_project() for every project in PROJECTS (a failure is logged and skipped).
 
-    STAGE-3 FIX (#9): if RUN_ALPHA_SENSITIVITY is True, also runs the
-    alpha-sensitivity sweep for each project (11 extra propagation
-    simulations per project - opt-in because it multiplies runtime).
+    If RUN_ALPHA_SENSITIVITY is True, also runs the alpha sweep for each successful project.
     """
     results = {}
     for project_name in PROJECTS:
@@ -750,9 +620,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
