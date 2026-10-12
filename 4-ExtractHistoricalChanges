@@ -1,7 +1,6 @@
 import os
 import subprocess
 import git
-from git.exc import GitCommandError
 import pandas as pd
 from collections import defaultdict
 from tqdm import tqdm
@@ -12,60 +11,27 @@ import matplotlib.pyplot as plt
 
 from temporal_config import get_cutoff, resolve_cutoff_commit, write_cutoff_marker
 
-# ====================== Configurable Settings ======================
-# Only change this section for each new batch of projects!
-
-# BASE_CODE_DIR is the folder that contains each project's own subfolder
-# (e.g. BASE_CODE_DIR\spring-framework, BASE_CODE_DIR\elasticsearch, ...)
+# ====================== Settings ======================
 BASE_CODE_DIR = r"D:\proje\python\Payannameh\Source"
 PROJECTS = ["spring-framework", "elasticsearch", "hadoop"]
 
-# If you want to look only at part of the history (e.g. from 2018 onwards)
-SINCE_DATE = None  # Example: "2018-01-01" or None for the entire history
+SINCE_DATE = None  # e.g. "2018-01-01", or None for the entire history
 
-# STAGE-1 TEMPORAL-SPLIT FIX (critique items #1, #2, #10, #14):
-# Previously the classification/regression TARGET was built from the
-# entire Git history, and propagation_frequency (a FEATURE) was ALSO built
-# from that same entire history - so the model was effectively predicting
-# the past from itself (post-hoc reconstruction, not future-change
-# prediction), and train_test_split could not undo this because the
-# leakage happens before the split even exists.
-#
-# TEMPORAL_CUTOFF_DATE splits history into two windows:
-#   - "before" (commits up to and including this date): a legitimate
-#     historical-activity feature (how much did this class change UP TO
-#     the prediction point) - NOT used here as the target.
-#   - "after" (commits strictly after this date): the actual prediction
-#     TARGET (how much did this class change in the future window).
-# TEMPORAL_CUTOFF_DATE now lives in temporal_config.py (single source,
-# shared with 0-ExtractCoChange.py) instead of being duplicated here.
-# Edit it there, not here. Leave as None only to reproduce the old
-# (leaky) whole-history behavior for comparison.
+# The temporal cutoff lives in temporal_config.py (shared with script 1).
+# "before" window = commits reachable from the anchor commit (context feature);
+# "after" window = anchor..HEAD (prediction target).
 
-# Threshold for the chart (optional)
-QUANTILE_THRESHOLD = 0.80  # Top 20% of changes = unstable
-
-# ================================================================
+QUANTILE_THRESHOLD = 0.80  # top 20% of change counts = unstable (used for the chart/report)
+# ======================================================
 
 EXPORT_DIR = "ExportFiles"
 
-# Logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def ensure_git_safe_directory(code_dir):
-    """
-    Registers code_dir as a 'safe.directory' in the global git config.
-    This prevents the 'dubious ownership' error that git raises when the
-    repository folder's ownership/permissions don't match the current user
-    (very common on Windows, external drives, or copied/cloned folders).
 
-    We register both the exact path AND a wildcard ('*') entry. Registering
-    only the exact path can silently fail to match on Windows due to path
-    normalization differences (backslash vs forward slash, drive-letter
-    case, symlinks, etc.), so the wildcard acts as a reliable fallback that
-    tells git to trust every repository directory.
-    """
+def ensure_git_safe_directory(code_dir):
+    """Register code_dir (and a '*' wildcard fallback) as git safe.directory to avoid 'dubious ownership' errors."""
     entries_to_try = [code_dir, code_dir.replace("\\", "/"), "*"]
     for entry in entries_to_try:
         try:
@@ -84,17 +50,14 @@ def ensure_git_safe_directory(code_dir):
 
 
 def get_class_name_from_relpath(rel_path):
-    """Convert a Java file path (already relative to the repo root, using '/'
-    as separator like git always does) to the fully qualified class name."""
+    """Convert a git-reported ('/'-separated, repo-relative) Java path to a fully-qualified class name."""
     if not rel_path.endswith(".java"):
         return None
-    # git always reports paths with '/' regardless of OS, so no os.sep here.
-    class_name = rel_path.replace("/", ".")[:-5]  # Remove .java and replace / with .
-    return class_name
+    return rel_path.replace("/", ".")[:-5]
 
 
 def _open_repo(code_dir):
-    """Open the repo, registering it as a safe.directory first, with one retry."""
+    """Open the repo after registering it as a safe.directory, with one retry."""
     ensure_git_safe_directory(code_dir)
     try:
         repo = git.Repo(code_dir)
@@ -118,17 +81,8 @@ def _open_repo(code_dir):
             return None
 
 
-def git_relpath_to_fqn(git_relpath):
-    """Repo-relative path (as reported by git, already '/'-separated) ->
-    fully-qualified class identity. See get_class_name_from_relpath, which
-    this now delegates to for backward compatibility."""
-    return get_class_name_from_relpath(git_relpath)
-
-
 def _build_rename_resolution_map(rename_pairs):
-    """Same rename-chain resolution as in the co-change script (STAGE-3 fix
-    #13) - kept as an independent copy here since these are standalone
-    scripts with no shared module."""
+    """Return resolve(path), mapping an old path to its final path (same logic as the co-change script)."""
     direct_map = dict(rename_pairs)
 
     def resolve(path, _seen=None):
@@ -144,32 +98,13 @@ def _build_rename_resolution_map(rename_pairs):
 
 
 def extract_historical_changes(code_dir, since=SINCE_DATE, until=None, diff_all_parents=False, rev_range=None):
-    """
-    Walk the commit history in the window (since, until] and count, per Java
-    class, how many commits touched it. STAGE-1 TEMPORAL-SPLIT FIX: passing
-    until=TEMPORAL_CUTOFF_DATE restricts to the "before" window (legitimate
-    historical-activity feature); passing since=TEMPORAL_CUTOFF_DATE (and
-    until=None) restricts to the "after" window (the actual target).
+    """Count, per Java class, how many commits touched it within the given window.
 
-    STAGE-3 FIX (critique item #12): now uses --no-merges EXPLICITLY (same
-    flag, same policy, as the co-change script), instead of relying on the
-    default first-parent behavior of plain `git log` (which happens to
-    produce empty file lists for merge commits, but is a different, less
-    explicit mechanism than the co-change script's --no-merges - the two
-    pipelines should state and use the identical policy).
-    diff_all_parents, if True, overrides this back to `-m` (diff every
-    parent for merges) for comparison/debugging; default is the
-    --no-merges policy shared with the co-change script.
-
-    STAGE-3 FIX (critique item #13): uses -M --name-status (rename-aware)
-    instead of --name-only, and resolves renamed files to their final,
-    current path (same resolution mechanism as the co-change script) before
-    counting - so a class's history is not silently split across an old and
-    new name, and its identity matches the current-snapshot dependency
-    graph / code metrics, which are built from the current file names.
-
-    Performance note: a single `git log` call streams the entire history in
-    one process instead of one `git diff` subprocess per commit.
+    - Merge commits are excluded (--no-merges), same policy as the co-change script;
+      diff_all_parents=True switches to '-m' for debugging.
+    - Renames are detected (-M --name-status) and resolved to the final path.
+    - Windows are defined by commit ancestry via `rev_range` (e.g. "<anchor>" or "<anchor>..HEAD").
+    - A single `git log` call is used for the whole window.
     """
     logger.info("Opening the Git repository...")
     repo = _open_repo(code_dir)
@@ -180,14 +115,12 @@ def extract_historical_changes(code_dir, since=SINCE_DATE, until=None, diff_all_
     if diff_all_parents:
         cmd.insert(4, "-m")
     else:
-        cmd.insert(4, "--no-merges")  # STAGE-3 FIX: explicit, shared policy with the co-change script
+        cmd.insert(4, "--no-merges")
     if since:
         cmd.append(f"--since={since}")
     if until:
         cmd.append(f"--until={until}")
     if rev_range:
-        # Temporal windows are defined by commit ancestry, not date strings:
-        # "before" = <anchor>, "after" = <anchor>..HEAD (disjoint by construction).
         cmd.append(rev_range)
     cmd += ["--", "*.java"]
 
@@ -198,11 +131,11 @@ def extract_historical_changes(code_dir, since=SINCE_DATE, until=None, diff_all_
         logger.error(f"git log failed: {e.stderr}")
         return {}
 
-    # Output looks like: \x00<hash>\n\n<status>\t<file1>\n...\x00<hash>\n\n...
+    # Output format: \x00<hash>\n\n<status>\t<file>\n...
     chunks = result.stdout.split("\x00")
     commit_hashes_seen = set()
 
-    # --- Pass 1: collect rename pairs across the whole window ---
+    # --- Pass 1: collect rename pairs across the window ---
     rename_pairs = []
     unparseable_status_lines = 0
     for chunk in chunks:
@@ -253,7 +186,7 @@ def extract_historical_changes(code_dir, since=SINCE_DATE, until=None, diff_all_
             if not path or not path.endswith(".java"):
                 continue
             resolved_path = resolve_fqn_path(path)
-            class_name = git_relpath_to_fqn(resolved_path)
+            class_name = get_class_name_from_relpath(resolved_path)
             if class_name:
                 class_change_count[class_name] += 1
             else:
@@ -262,7 +195,7 @@ def extract_historical_changes(code_dir, since=SINCE_DATE, until=None, diff_all_
     logger.info(f"Number of commits examined: {len(commit_hashes_seen)} (from {since or 'the beginning of the project'})")
     logger.info(f"Extraction completed. Number of changed classes: {len(class_change_count)}")
 
-    # STAGE-3 FIX (critique item #26): explicit, saved parsing statistics.
+    # Save parsing statistics for per-project reporting
     parsing_stats = {
         'window_since': since, 'window_until': until, 'rev_range': rev_range,
         'commits_examined': len(commit_hashes_seen),
@@ -283,6 +216,7 @@ def extract_historical_changes(code_dir, since=SINCE_DATE, until=None, diff_all_
 
     return dict(class_change_count)
 
+
 def plot_distribution(change_counts, project_name, histogram_output):
     df = pd.DataFrame(list(change_counts.items()), columns=["class_name", "change_count"])
     df = df[df["change_count"] > 0].sort_values("change_count", ascending=False)
@@ -301,9 +235,9 @@ def plot_distribution(change_counts, project_name, histogram_output):
     plt.close()
     logger.info(f"Distribution chart saved: {histogram_output}")
 
+
 def _save_changes(changes, project_dir, project_name, csv_name, pkl_name, histogram_name, label):
-    """Shared save/report helper, factored out so the same logic can be
-    applied to the whole-history, 'before', and 'after' windows."""
+    """Save change counts (CSV, pkl, histogram) and log a summary for one window."""
     if not changes:
         logger.warning(f"[{project_name}] No changes found for window '{label}'.")
         return None
@@ -328,34 +262,23 @@ def _save_changes(changes, project_dir, project_name, csv_name, pkl_name, histog
 
 
 def process_project(project_name, code_dir):
-    """
-    Run the full historical-change extraction pipeline for a single project.
+    """Extract and save change counts for one project.
 
-    STAGE-1 TEMPORAL-SPLIT FIX: if TEMPORAL_CUTOFF_DATE is set, this now
-    additionally extracts and saves two separate windows:
-      - class_change_frequency_before.pkl: commits up to the cutoff
-        (a legitimate historical-activity feature - genuinely known "at
-        prediction time").
-      - class_change_frequency_after.pkl: commits strictly after the cutoff
-        (the actual prediction TARGET; used by prepare_data_combined
-        instead of the whole-history file when available).
-    The original whole-history class_change_frequency.pkl is still produced
-    for backward compatibility / diagnostics, but the pipeline should use
-    the "after" file as the target once temporal mode is enabled - see
-    prepare_data_combined.
+    Produces the whole-history file (diagnostics only) plus, when a cutoff is set,
+    class_change_frequency_before.pkl (context feature) and
+    class_change_frequency_after.pkl (prediction target).
     """
     logger.info(f"Starting historical change extraction for project: {project_name}")
 
     project_dir = os.path.join(EXPORT_DIR, project_name)
     os.makedirs(project_dir, exist_ok=True)
 
-    # Whole-history extraction (kept for backward compatibility/diagnostics).
     changes = extract_historical_changes(code_dir, SINCE_DATE)
     _save_changes(changes, project_dir, project_name,
                  "historical_class_changes.csv", "class_change_frequency.pkl",
                  "historical_changes_distribution.png", "whole-history (legacy)")
 
-    cutoff = get_cutoff(project_name)          # raises if no cutoff is configured
+    cutoff = get_cutoff(project_name)  # raises if no cutoff is configured
     anchor = None
     if cutoff:
         anchor = resolve_cutoff_commit(code_dir, cutoff)
@@ -378,20 +301,13 @@ def process_project(project_name, code_dir):
     logger.info(f"Cutoff marker written to '{marker_path}' (temporal_cutoff_date={cutoff!r}, anchor={anchor}); "
                 f"4-MLPipeline.py checks it against the markers of scripts 0, 1 and 2.")
 
+
 def main():
     for project_name in PROJECTS:
         code_dir = os.path.join(BASE_CODE_DIR, project_name)
         logger.info(f"\n{'=' * 80}\nProcessing project: {project_name}\n{'=' * 80}")
         process_project(project_name, code_dir)
 
+
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
