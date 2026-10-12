@@ -1,0 +1,574 @@
+import os
+import javalang
+import pickle
+import logging
+import time
+from collections import defaultdict
+import networkx as nx
+
+# STAGE-4 FIX (critique item #8): same snapshot-consistency fix as
+# 1-DependencyGraph.py - static metrics must be computed from the code as it
+# existed AT TEMPORAL_CUTOFF_DATE, not from whatever commit is currently
+# checked out on disk. git_snapshot_at is defined further below, after
+# `logger` exists.
+from temporal_config import get_cutoff, resolve_cutoff_commit, write_cutoff_marker
+
+EXPORT_DIR = "ExportFiles"
+os.makedirs(EXPORT_DIR, exist_ok=True)
+ERROR_LOG_FILE = os.path.join(EXPORT_DIR, 'metrics_warnings_errors.log')
+
+class InfoFilter(logging.Filter):
+    def filter(self, record): return record.levelno == logging.INFO
+
+logger = logging.getLogger('code_metrics_calculator')
+logger.setLevel(logging.INFO)
+logger.propagate = False
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.addFilter(InfoFilter())
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+file_handler = logging.FileHandler(ERROR_LOG_FILE, mode='w', encoding='utf-8')
+file_handler.setLevel(logging.WARNING)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'))
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
+
+# ============================================================
+# STAGE-4 FIX (critique item #8): inlined from git_snapshot_utils.py so
+# everything lives in one file. See the class docstring for details.
+# ============================================================
+import subprocess as _subprocess_for_git_snapshot
+
+
+class git_snapshot_at:
+    """
+    Context manager: checks out `code_dir`'s git repo to the last commit at
+    or before `cutoff_date` (a "YYYY-MM-DD" string) for the duration of the
+    `with` block, then restores the original HEAD/branch afterward - even
+    if an exception occurs inside the block.
+
+    If cutoff_date is None (temporal mode not enabled), this is a no-op: it
+    leaves the repo exactly as it is, so non-temporal runs are unaffected.
+    """
+
+    def __init__(self, code_dir, cutoff_date):
+        self.code_dir = code_dir
+        self.cutoff_date = cutoff_date
+        self._original_ref = None
+        self._commit_at_cutoff = None
+        self._active = cutoff_date is not None
+
+    def _run(self, *args):
+        result = _subprocess_for_git_snapshot.run(
+            ["git", "-C", self.code_dir, *args],
+            capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip()
+
+    @staticmethod
+    def _is_hash(ref):
+        return len(ref) in (7, 8, 9, 10, 11, 12, 40) and all(c in "0123456789abcdef" for c in ref.lower())
+
+    def __enter__(self):
+        if not self._active:
+            logger.info(f"[{self.code_dir}] git_snapshot_at: no TEMPORAL_CUTOFF_DATE set, using repo as-is (HEAD).")
+            return self
+
+        branch = self._run("rev-parse", "--abbrev-ref", "HEAD")
+        self._original_ref = branch if branch != "HEAD" else self._run("rev-parse", "HEAD")
+
+        # Only tracked-file modifications are dangerous (they could be carried
+        # into the historical snapshot). Untracked files can't be overwritten
+        # silently by checkout, so they only produce a warning.
+        dirty = self._run("status", "--porcelain", "--untracked-files=no")
+        if dirty:
+            raise RuntimeError(
+                f"[{self.code_dir}] git_snapshot_at: tracked files have uncommitted "
+                f"changes. Commit, stash, or reset before running - refusing to "
+                f"check out over uncommitted work.\n{dirty[:500]}"
+            )
+
+        untracked_java = [
+            line[3:] for line in
+            self._run("status", "--porcelain", "--untracked-files=all").splitlines()
+            if line.startswith("??") and line.rstrip().endswith(".java")
+        ]
+        if untracked_java:
+            logger.warning(
+                f"[{self.code_dir}] git_snapshot_at: {len(untracked_java)} untracked "
+                f".java file(s) will be included in metrics (e.g. {untracked_java[:3]}). "
+                f"Remove them if they are not part of the snapshot."
+            )
+
+        # Same anchor definition as scripts 0 and 3 (temporal_config.resolve_cutoff_commit).
+        self._commit_at_cutoff = resolve_cutoff_commit(self.code_dir, self.cutoff_date, "HEAD")
+        if not self._commit_at_cutoff:
+            raise RuntimeError(
+                f"[{self.code_dir}] git_snapshot_at: no commit found at or before "
+                f"{self.cutoff_date}. Check TEMPORAL_CUTOFF_DATE against this project's "
+                f"actual commit history."
+            )
+
+        logger.info(f"[{self.code_dir}] git_snapshot_at: checking out commit {self._commit_at_cutoff} "
+                    f"(last commit at/before {self.cutoff_date}); was on '{self._original_ref}'.")
+        self._run("checkout", "--detach", self._commit_at_cutoff)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self._active:
+            return False
+        logger.info(f"[{self.code_dir}] git_snapshot_at: restoring original ref '{self._original_ref}'.")
+        self._run("checkout", self._original_ref)
+        return False
+
+    @property
+    def commit_hash(self):
+        return self._commit_at_cutoff
+
+
+def get_class_name_from_path(file_path, repo_root):
+    """
+    Path-based fully-qualified class identity (package.ClassName). Identical
+    convention to get_class_name_from_path() in the co-change script and
+    get_class_name_from_relpath() in the historical-changes script.
+    STAGE-1 ENTITY-RESOLUTION FIX: code_metrics is now keyed by this
+    identity instead of the bare simple class name, so it can be merged
+    correctly with the (also FQN-keyed) dependency graph and historical
+    change counts without collisions between same-named classes in
+    different packages.
+    """
+    try:
+        rel_path = os.path.relpath(file_path, repo_root)
+        if not rel_path.endswith(".java"):
+            return None
+        return rel_path.replace(os.sep, '.').replace('/', '.')[:-5]
+    except Exception:
+        return None
+
+
+def calculate_loc(file_path):
+    loc = 0
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            in_multiline_comment = False
+            for line in f:
+                stripped_line = line.strip()
+                if in_multiline_comment:
+                    if '*/' in stripped_line:
+                        in_multiline_comment = False
+                        stripped_line = stripped_line[stripped_line.find('*/') + 2:].strip()
+                        if not stripped_line or stripped_line.startswith('//'): continue
+                    continue
+                if stripped_line.startswith('/*'):
+                    if '*/' in stripped_line:
+                        remaining = stripped_line[stripped_line.find('*/') + 2:].strip()
+                        if remaining and not remaining.startswith('//'): loc += 1
+                        continue
+                    in_multiline_comment = True
+                    before_comment = stripped_line[:stripped_line.find('/*')].strip()
+                    if before_comment and not before_comment.startswith('//'): loc += 1
+                    continue
+                if stripped_line and not stripped_line.startswith('//'): loc += 1
+    except FileNotFoundError:
+        logger.warning(f"LOC calculation: File not found {file_path}")
+        return 0
+    except Exception as e:
+        logger.error(f"Error in LOC calculation for {file_path}: {e}")
+        return 0
+    return loc
+
+def calculate_cyclomatic_complexity(tree_node):
+    complexity = 1
+    decision_node_types = (javalang.tree.IfStatement, javalang.tree.WhileStatement, javalang.tree.DoStatement,
+                           javalang.tree.ForStatement, javalang.tree.SwitchStatementCase, javalang.tree.CatchClause,
+                           javalang.tree.TernaryExpression)
+    decision_operators = {'&&', '||'}
+    try:
+        nodes_to_check = tree_node if not isinstance(tree_node, javalang.tree.CompilationUnit) else filter(lambda x: x[1] is not None, tree_node)
+        for _, node in ((path, node) for path, node in nodes_to_check if node is not None):
+            if isinstance(node, decision_node_types): complexity += 1
+            elif isinstance(node, javalang.tree.BinaryOperation) and node.operator in decision_operators: complexity += 1
+    except AttributeError:
+        pass
+    except Exception as e:
+        logger.warning(f"Warning in CC calculation during node traversal: {e}")
+    return complexity
+
+def get_method_field_access(class_node):
+    method_access = defaultdict(set)
+    class_fields = set()
+    if not class_node or not hasattr(class_node, 'fields'): return method_access
+    for field_decl in class_node.fields:
+        if hasattr(field_decl, 'declarators'):
+            for declarator in field_decl.declarators:
+                if hasattr(declarator, 'name'): class_fields.add(declarator.name)
+    if not class_fields or not hasattr(class_node, 'methods'): return method_access
+    for method in class_node.methods:
+        if not hasattr(method, 'name'): continue
+        method_name = method.name
+        try:
+            for _, node in ((path, node) for path, node in method if node is not None):
+                if isinstance(node, javalang.tree.MemberReference):
+                    if node.member in class_fields and (node.qualifier is None or node.qualifier == 'this'):
+                        method_access[method_name].add(node.member)
+                elif isinstance(node, javalang.tree.Assignment):
+                    if isinstance(node.expressionl, javalang.tree.MemberReference):
+                        if node.expressionl.member in class_fields and (node.expressionl.qualifier is None or node.expressionl.qualifier == 'this'):
+                            method_access[method_name].add(node.expressionl.member)
+        except AttributeError:
+            pass
+        except Exception as e:
+            logger.warning(f"Error in field access analysis for method '{method_name}' in class '{getattr(class_node, 'name', 'N/A')}': {e}")
+    return method_access
+
+def calculate_lcom4_approx(tree, class_name):
+    """
+    STAGE-3 FIX (critique item #5): this is LCOM4-approx, NOT standard LCOM4.
+    It must always be reported/labeled as 'lcom4_approx' (never bare 'LCOM4')
+    in the paper, and validated against a reference static-analysis tool
+    before being presented as a faithful LCOM4 measurement.
+
+    What this DOES measure: the number of connected components in a graph
+    where two methods are connected if they both directly access ('this.x'
+    or unqualified 'x') the same DECLARED field of this class.
+
+    Known deviations from the standard LCOM4 definition (must be stated in
+    Threats to Validity if this metric is reported as 'LCOM4' anywhere):
+      1. Method-invocation relationships between methods are NOT modeled
+         (standard LCOM4 also connects methods that call each other).
+      2. Inherited fields are NOT considered (only fields declared directly
+         in this class).
+      3. Static fields are not treated specially from instance fields.
+      4. Field access through OTHER objects (obj.field) is not modeled,
+         only direct/'this'-qualified access to this class's own fields.
+      5. A class with 0-1 methods returns 1 by convention (not
+         graph-theoretically derived), matching common tool behavior but
+         worth stating explicitly.
+    """
+    class_node = None
+    methods_in_class = []
+    try:
+        for _, node in tree.filter(javalang.tree.TypeDeclaration):
+            if isinstance(node, javalang.tree.ClassDeclaration) and node.name == class_name:
+                class_node = node; break
+        if not class_node or not hasattr(class_node, 'methods'):
+            num_methods_direct = len([m for m in class_node.methods if hasattr(m, 'name')]) if class_node and hasattr(class_node, 'methods') else 0
+            return 1 if num_methods_direct <= 1 else 0
+        methods_in_class = [m for m in class_node.methods if hasattr(m, 'name')]
+        method_names = [m.name for m in methods_in_class]
+        if len(method_names) <= 1: return 1
+        method_access = get_method_field_access(class_node)
+        method_graph = nx.Graph()
+        method_graph.add_nodes_from(method_names)
+        method_list_for_pairing = list(method_access.keys())
+        for i in range(len(method_list_for_pairing)):
+            for j in range(i + 1, len(method_list_for_pairing)):
+                m1, m2 = method_list_for_pairing[i], method_list_for_pairing[j]
+                if method_access.get(m1, set()) & method_access.get(m2, set()): method_graph.add_edge(m1, m2)
+        return nx.number_connected_components(method_graph)
+    except Exception as e:
+        logger.warning(f"Error in LCOM4 approximate calculation for class '{class_name}': {e}")
+        return len(methods_in_class) if methods_in_class else 0
+
+def extract_dependency_types(tree):
+    types = set()
+    primitives_and_common = {'byte', 'short', 'int', 'long', 'float', 'double', 'boolean', 'char', 'void', 'String',
+                             'Object', 'Integer', 'Long', 'Double', 'Float', 'Boolean', 'Character', 'Byte', 'Short',
+                             'Class', 'Exception', 'Throwable', 'Override'}
+    try:
+        for _, node in filter(lambda x: x[1] is not None, tree.filter(javalang.tree.ReferenceType)):
+            if hasattr(node, 'name') and node.name and node.name not in primitives_and_common:
+                types.add(node.name)
+                if node.arguments:
+                    for arg in filter(lambda a: a is not None and hasattr(a, 'type'), node.arguments):
+                        if isinstance(arg.type, javalang.tree.ReferenceType) and hasattr(arg.type, 'name') and arg.type.name and arg.type.name not in primitives_and_common:
+                            types.add(arg.type.name)
+        for _, node in filter(lambda x: x[1] is not None, tree.filter(javalang.tree.ClassCreator)):
+            if hasattr(node, 'type') and node.type and hasattr(node.type, 'name') and node.type.name and node.type.name not in primitives_and_common:
+                types.add(node.type.name)
+                if hasattr(node.type, 'arguments') and node.type.arguments:
+                    for arg in filter(lambda a: a is not None and hasattr(a, 'type'), node.type.arguments):
+                        if isinstance(arg.type, javalang.tree.ReferenceType) and hasattr(arg.type, 'name') and arg.type.name and arg.type.name not in primitives_and_common:
+                            types.add(arg.type.name)
+        for _, node in filter(lambda x: x[1] is not None, tree.filter(javalang.tree.Cast)):
+            if hasattr(node, 'type') and node.type and hasattr(node.type, 'name') and node.type.name and node.type.name not in primitives_and_common:
+                types.add(node.type.name)
+    except Exception as e:
+        logger.warning(f"Error in extracting dependency types: {e}")
+    return types
+
+def calculate_cbo_approx(tree, class_name):
+    """
+    STAGE-3 FIX (critique item #4): this is CBO-approx ('Type Dependency
+    Count'), NOT standard CBO. It must always be reported/labeled as
+    'cbo_approx' (never bare 'CBO') in the paper.
+
+    What this DOES measure: the count of DISTINCT other type names
+    syntactically referenced anywhere in this class's source (field types,
+    return types, parameter types, local variable types, generic type
+    arguments, 'new' expressions, casts), excluding common
+    primitives/JDK boilerplate types and the class's own name.
+
+    Known deviations from the Chidamber & Kemerer CBO definition (must be
+    stated in Threats to Validity if this metric is reported as 'CBO'):
+      1. CBO is normally defined over METHOD/INSTANCE-VARIABLE COUPLING via
+         actual usage (a class C is coupled to D if C's methods/variables
+         use D's methods/instance variables); this instead counts distinct
+         type NAMES appearing anywhere in the syntax, which is a coarser,
+         name-based proxy, not a usage-based coupling measure.
+      2. It does not distinguish inheritance-based coupling from
+         association/usage-based coupling.
+      3. It is symmetric by construction only in the sense that it counts
+         outgoing references from C; it does not verify the referenced type
+         is an actual project class (it can count JDK/library type names).
+      4. Referenced type names are NOT resolved to fully-qualified
+         identities here (unlike the dependency-graph script's entity
+         resolution fix) - two different classes with the same simple name
+         in different packages would count as one distinct dependency, a
+         known undercount risk for this specific metric.
+    """
+    all_dep_types = extract_dependency_types(tree)
+    if class_name in all_dep_types: all_dep_types.remove(class_name)
+    return len(all_dep_types)
+
+def calculate_method_metrics(tree, class_name):
+    num_methods = total_method_cc = 0
+    avg_method_cc = 0.0
+    try:
+        target_node = None
+        for _, node in tree.filter(javalang.tree.TypeDeclaration):
+            if isinstance(node, (javalang.tree.ClassDeclaration, javalang.tree.InterfaceDeclaration)) and node.name == class_name:
+                target_node = node; break
+        if not target_node or not hasattr(target_node, 'methods'): return 0, 0, 0.0
+        for method in target_node.methods:
+            if isinstance(method, javalang.tree.MethodDeclaration) and hasattr(method, 'name'):
+                num_methods += 1
+                total_method_cc += calculate_cyclomatic_complexity(method)
+        if num_methods > 0: avg_method_cc = total_method_cc / num_methods
+    except Exception as e:
+        logger.warning( f"Cannot calculate method metrics for type '{class_name}': {type(e).__name__} - {e}")
+        return 0, 0, 0.0
+    return num_methods, total_method_cc, avg_method_cc
+
+def compute_code_metrics_for_project(code_dir, project_name):
+    code_metrics = {}
+    logger.info(f"Starting advanced code metrics calculation for {code_dir}...")
+    start_time = time.time()
+    file_count = processed_files = error_files = skipped_files = 0
+    project_dir = os.path.join(EXPORT_DIR, project_name)
+    os.makedirs(project_dir, exist_ok=True)
+    logger.info("Counting Java files...")
+    try:
+        for root, _, files in os.walk(code_dir): file_count += sum(1 for f in files if f.endswith(".java"))
+        logger.info(f"{file_count} Java files found for processing.")
+    except Exception as e:
+        logger.error(f"Error in counting files: {e}")
+        return None
+    if file_count == 0:
+        logger.warning("No Java files found in directory.")
+        return {}
+    log_interval = max(1, file_count // 20)
+    files_processed_since_log = 0
+    for root, _, files in os.walk(code_dir):
+        for file in files:
+            if file.endswith(".java"):
+                file_path = os.path.join(root, file)
+                class_name = None
+                metrics = {}
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
+                    if not content.strip(): skipped_files += 1; continue
+                    tree = javalang.parse.parse(content)
+                    primary_type_node = None
+                    for _, node in tree.filter(javalang.tree.TypeDeclaration):
+                        if isinstance(node, (javalang.tree.ClassDeclaration, javalang.tree.InterfaceDeclaration, javalang.tree.EnumDeclaration)) and hasattr(node, 'name'):
+                            class_name = node.name; primary_type_node = node; break
+                    if not class_name: skipped_files += 1; continue
+                    metrics['loc'] = calculate_loc(file_path)
+                    metrics['cc_class'] = calculate_cyclomatic_complexity(tree)
+                    metrics['cbo_approx'] = calculate_cbo_approx(tree, class_name)
+                    if isinstance(primary_type_node, javalang.tree.ClassDeclaration):
+                        metrics['lcom4_approx'] = calculate_lcom4_approx(tree, class_name)
+                        num_methods, total_cc, avg_cc = calculate_method_metrics(tree, class_name)
+                    elif isinstance(primary_type_node, javalang.tree.InterfaceDeclaration):
+                        metrics['lcom4_approx'] = 1
+                        num_methods, total_cc, avg_cc = calculate_method_metrics(tree, class_name)
+                    else:
+                        metrics['lcom4_approx'] = 1
+                        num_methods, total_cc, avg_cc = 0, 0, 0.0
+                    metrics['num_methods'] = num_methods
+                    metrics['total_method_cc'] = total_cc
+                    metrics['ccn'] = avg_cc
+                    # STAGE-1 ENTITY-RESOLUTION FIX: key by the fully-qualified,
+                    # path-based identity (matching the dependency graph and
+                    # historical-changes scripts) instead of the bare simple
+                    # class_name, which would silently merge same-named classes
+                    # from different packages (e.g. two different 'Builder'
+                    # classes in different modules) into a single dict entry.
+                    fqn = get_class_name_from_path(file_path, code_dir)
+                    if not fqn:
+                        skipped_files += 1
+                        continue
+                    code_metrics[fqn] = metrics
+                    processed_files += 1
+                    files_processed_since_log += 1
+                    if files_processed_since_log >= log_interval:
+                        elapsed = time.time() - start_time
+                        percent_done = (processed_files + error_files + skipped_files) / file_count * 100
+                        logger.info(f"Code metrics: Processed ~{processed_files + error_files + skipped_files}/{file_count} files ({percent_done:.1f}%)... Successful: {processed_files}, Errors: {error_files}, Skipped: {skipped_files}. ({elapsed:.1f}s)")
+                        files_processed_since_log = 0
+                except (javalang.tokenizer.LexerError, javalang.parser.JavaSyntaxError) as e_parse:
+                    logger.warning(f"Parse error for metrics {os.path.basename(file_path)}: {type(e_parse).__name__} - {e_parse}")
+                    error_files += 1
+                except FileNotFoundError:
+                    logger.warning(f"FNF metrics: {file_path}")
+                    error_files += 1
+                except Exception as e:
+                    logger.error(f"Unexpected error processing {os.path.basename(file_path)}: {type(e).__name__} - {e}")
+                    error_files += 1
+    end_time = time.time()
+    total_processed_or_attempted = processed_files + error_files + skipped_files
+    logger.info(f"Code metrics calculation completed in {end_time - start_time:.2f} seconds.")
+    logger.info(f"Metrics successfully calculated for {len(code_metrics)} types.")
+    logger.info(f"Total Java files found: {file_count}")
+    logger.info(f"Successfully processed files: {processed_files}")
+    logger.info(f"Skipped files (empty/no primary type): {skipped_files}")
+    logger.info(f"Failed files (parse/other errors): {error_files}")
+    if total_processed_or_attempted != file_count:
+        logger.warning(f"Count mismatch: Total processed/skipped/failed ({total_processed_or_attempted}) != Total files found ({file_count}).")
+
+    # STAGE-3 FIX (critique item #26): parsing/exclusion stats must be
+    # reportable per project (Total files / Parsed / Failures / Skipped /
+    # % excluded), not only visible as scrolling console log lines - a
+    # systematic exclusion pattern (e.g. modern-syntax or generated files
+    # failing to parse) is a selection-bias risk that needs to be checkable.
+    exclusion_pct = (100.0 * (skipped_files + error_files) / file_count) if file_count > 0 else 0.0
+    parsing_stats = {
+        'total_java_files_found': file_count,
+        'successfully_processed': processed_files,
+        'skipped_empty_or_no_primary_type': skipped_files,
+        'failed_parse_or_other_error': error_files,
+        'pct_excluded_from_final_dataset': exclusion_pct,
+    }
+    try:
+        with open(os.path.join(project_dir, "parsing_stats_code_metrics.pkl"), "wb") as f:
+            pickle.dump(parsing_stats, f)
+        logger.info(f"Parsing stats saved (excluded {exclusion_pct:.1f}% of {file_count} Java files: "
+                    f"{skipped_files} skipped + {error_files} failed).")
+    except Exception as e:
+        logger.warning(f"Could not save code-metrics parsing stats: {e}")
+
+    return code_metrics
+
+METRIC_DEFINITIONS_DOC = """\
+METRIC DEFINITIONS - APPROXIMATE vs STANDARD (for paper methodology / Threats to Validity)
+============================================================================================
+
+This project computes lightweight, javalang-based APPROXIMATIONS of several
+well-known metrics. None of them should be reported under the bare standard
+name in the paper; use the '-approx' names below and cite this file's
+deviation list in Threats to Validity.
+
+cbo_approx (NOT standard CBO / Chidamber & Kemerer)
+----------------------------------------------------
+Counts distinct type NAMES syntactically referenced in the class (field
+types, return types, parameter types, local variable types, generic
+arguments, 'new' expressions, casts), excluding primitives/common JDK
+boilerplate and the class's own name.
+Deviations from standard CBO: name-based rather than usage-based coupling;
+does not distinguish inheritance vs association coupling; does not resolve
+referenced names to fully-qualified identities (same-simple-name classes in
+different packages undercount as one dependency).
+
+lcom4_approx (NOT standard LCOM4)
+----------------------------------
+Counts connected components in a graph where two methods are linked if they
+directly access the same DECLARED field of the class.
+Deviations from standard LCOM4: no method-invocation edges; no inherited
+fields; no special handling of static fields; no access-through-other-object
+modeling.
+
+cc_class / ccn (Cyclomatic Complexity - decision points counted)
+--------------------------------------------------------------------
+Decision points counted: if / while / do / for / switch-case / catch /
+ternary-expression / && / ||. cc_class is computed over the WHOLE class AST;
+ccn is the mean per-method complexity. Confirm this decision-point set
+matches whatever CC definition is cited as the reference in the paper.
+
+architecture_size (Composite Structural Complexity Index - NOT a validated
+single latent construct)
+----------------------------------------------------------------------------
+Unweighted mean of min-max-normalized loc, num_methods, cbo_approx,
+lcom4_approx, total_method_cc, cc_class. LOC, coupling, cohesion, and
+complexity are conceptually distinct properties; this composite has not
+been construct-validated (e.g. via factor analysis) as measuring one
+underlying dimension. Report as 'Composite Structural Complexity Index',
+not 'architecture size', unless/until validated.
+"""
+
+
+def write_metric_definitions_doc(project_dir):
+    """Writes METRIC_DEFINITIONS_DOC to the project's output folder so it can
+    be attached directly to the paper's methodology section."""
+    try:
+        path = os.path.join(project_dir, "metric_definitions.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(METRIC_DEFINITIONS_DOC)
+        logger.info(f"Metric definitions/deviations doc written to '{path}'")
+    except Exception as e:
+        logger.warning(f"Could not write metric_definitions.txt: {e}")
+
+
+def main(project_name, code_dir):
+    project_dir = os.path.join(EXPORT_DIR, project_name)
+    os.makedirs(project_dir, exist_ok=True)
+    write_metric_definitions_doc(project_dir)
+    metrics_file = os.path.join(project_dir, "code_metrics.pkl")
+    logger.info("--- Starting advanced code metrics calculation ---")
+    logger.info(f"INFO messages shown here. Warnings and errors logged to '{ERROR_LOG_FILE}'.")
+    overall_start_time = time.time()
+    if not os.path.isdir(code_dir):
+        logger.error(f"Source code directory not found: {code_dir}.")
+        logger.info("Program stopped due to missing source directory.")
+        return
+    # STAGE-4 FIX (critique item #8): extract static metrics from the
+    # temporal-cutoff snapshot, not from HEAD. No-op if TEMPORAL_CUTOFF_DATE
+    # is None.
+    cutoff = get_cutoff(project_name)          # raises if no cutoff is configured
+    snap = git_snapshot_at(code_dir, cutoff)
+    with snap:
+        metrics = compute_code_metrics_for_project(code_dir, project_name)
+    if metrics:
+        try:
+            with open(metrics_file, "wb") as f: pickle.dump(metrics, f)
+            write_cutoff_marker(project_dir, "metrics", cutoff, snap.commit_hash)
+            logger.info(f"Advanced code metrics successfully saved to '{metrics_file}'")
+        except Exception as e:
+            logger.error(f"Cannot save code metrics to pickle file: {e}")
+            logger.info(f"Saving metrics to '{metrics_file}' failed. Check '{ERROR_LOG_FILE}'.")
+    else:
+        logger.warning("No metrics calculated (likely no processable Java files found). Output file not saved.")
+        logger.info("No metrics calculated. Output file not saved.")
+    logger.info(f"--- Advanced code metrics calculation completed in {time.time() - overall_start_time:.2f} seconds ---")
+    logger.info(f"Check '{ERROR_LOG_FILE}' for warnings or errors.")
+
+if __name__ == "__main__":
+    # ====================== Configurable Settings ======================
+    # Only change this section for each new batch of projects!
+    # BASE_CODE_DIR is the folder that contains each project's own subfolder
+    # (e.g. BASE_CODE_DIR\spring-framework, BASE_CODE_DIR\elasticsearch, ...)
+    BASE_CODE_DIR = r"D:\proje\python\Payannameh\Source"
+    PROJECTS = ["spring-framework", "elasticsearch", "hadoop"]
+    # ================================================================
+
+    for project_name in PROJECTS:
+        code_dir = os.path.join(BASE_CODE_DIR, project_name)
+        logger.info(f"\n{'=' * 80}\nProcessing project: {project_name}\n{'=' * 80}")
+        main(project_name, code_dir)
+
+
+
+
+
+
+
